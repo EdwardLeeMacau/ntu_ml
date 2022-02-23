@@ -1,0 +1,6 @@
+# Downloaded data
+*_data
+
+# Trained Model
+*.npy
+
