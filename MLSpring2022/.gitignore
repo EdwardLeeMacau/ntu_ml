@@ -1,0 +1,20 @@
+# Downloaded data
+*_data
+
+# Trained Model
+*.npy
+*.pth
+
+# Checkpoints directory
+checkpoints
+
+# Logs directory
+logs
+
+# Output directory
+output
+
+# Zipped files
+*.zip
+*.tar.gz
+*.tgz
