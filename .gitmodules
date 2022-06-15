@@ -1,0 +1,21 @@
+[submodule "ntu_dlcv_spring_2019_hw2"]
+	path = dlcv_spring_2019/yolo-v1
+	url = git@github.com:EdwardLeeMacau/ntu_dlcv_spring_2019_hw2.git
+[submodule "ntu_dlcv_spring_2019_hw3"]
+	path = dlcv_spring_2019/gan-tl
+	url = git@github.com:EdwardLeeMacau/ntu_dlcv_spring_2019_hw3.git
+[submodule "ntu_dlcv_spring_2019_hw4"]
+	path = dlcv_spring_2019/rnn
+	url = git@github.com:EdwardLeeMacau/ntu_dlcv_spring_2019_hw4.git
+[submodule "dlcv_spring_2019/ntu_dlcv_spring_2019_hw1"]
+	path = dlcv_spring_2019/traditional
+	url = git@github.com:EdwardLeeMacau/ntu_dlcv_spring_2019_hw1.git
+[submodule "dlcv_spring_2019/ntu_dlcv_spring_2019_cast_search"]
+	path = dlcv_spring_2019/cast_search
+	url = git@github.com:EdwardLeeMacau/ntu_dlcv_spring_2019_cast_search.git
+[submodule "single_image_dehazing/PFFNet"]
+	path = single_image_dehazing/pffnet
+	url = git@github.com:EdwardLeeMacau/PFFNet.git
+[submodule "single_image_dehazing/AtJ_DH"]
+	path = single_image_dehazing/atj_dh
+	url = git@github.com:EdwardLeeMacau/AtJ_DH.git
