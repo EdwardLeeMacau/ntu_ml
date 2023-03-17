@@ -1,0 +1,14 @@
+# Python intermediate
+__pycache__
+
+# Dataset
+data
+ml2023spring-hw3.zip
+
+# Generated model
+*.ckpt
+
+# Generated file
+*.csv
+/metrics.json
+/runs
