@@ -1,0 +1,21 @@
+epochs: 250
+optimizer:
+  name: RAdam
+  kwargs:
+    lr: 3.0e-4
+    weight_decay: 1.0e-5
+batch-size: 32
+seed: 3407
+ratio: 0.99
+scheduler:
+  name: StepLR
+  kwargs:
+    gamma: 0.1
+    step_size: 200
+    step_unit: epoch
+model:
+  dropout: 0.5
+  n-frames: 15
+  bidirectional: true
+  hidden_dim: 256
+  hidden_layers: 10

@@ -1,0 +1,41 @@
+metrics:
+  - metrics.json
+
+params:
+  - params.yaml
+
+# https://dvc.org/doc/start/data-management/metrics-parameters-plots
+plots:
+  - ROC:
+      template: simple
+      x: fpr
+      y:
+        eval/live/plots/sklearn/roc/train.json: tpr
+        eval/live/plots/sklearn/roc/test.json: tpr
+  - Confusion-Matrix:
+      template: confusion
+      x: actual
+      y:
+        eval/live/plots/sklearn/cm/train.json: predicted
+        eval/live/plots/sklearn/cm/test.json: predicted
+  - eval/importance.png
+
+stages:
+  prepare:
+    cmd:
+      - "kaggle competitions download -c ml2023spring-hw2"
+      - "unzip ml2023spring-hw2.zip"
+      - "rm ml2023spring-hw2.zip"
+    outs:
+      - libriphone
+  train:
+    cmd: python main.py --train
+    deps:
+      - libriphone
+      - main.py
+      - model.py
+      - params.yaml
+    outs:
+      - metrics.json
+      - model.ckpt
+      - model_end.ckpt

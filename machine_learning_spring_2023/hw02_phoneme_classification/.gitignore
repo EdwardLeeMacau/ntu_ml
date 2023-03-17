@@ -1,0 +1,14 @@
+# Python intermediate
+__pycache__
+
+# Dataset
+libriphone
+ml2023spring-hw2.zip
+
+# Generated model
+*.ckpt
+
+# Generated file
+*.csv
+/metrics.json
+/runs
