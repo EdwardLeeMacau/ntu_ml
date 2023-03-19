@@ -11,6 +11,7 @@ _scheduler = {
     'StepLR': StepLR,
 }
 
+""" Mapping table, to convert string as optimizer constructor. """
 _optimizer = {
     'Adam': Adam,
     'RAdam': RAdam,
@@ -37,3 +38,6 @@ def flatten(param: Dict, prefix: str = ""):
         retval.update(flatten(v, p)) if isinstance(v, dict) else retval.update({p: v})
 
     return retval
+
+def count_parameters(model: torch.nn.Module):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)

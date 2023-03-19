@@ -33,6 +33,13 @@ class LibriDataset(Dataset):
     def __len__(self):
         return len(self.data)
 
+# Reference:
+#
+# My implementation from previous course (Applied Deep Learning, Fall 2022).
+# https://nol.ntu.edu.tw/nol/coursesearch/print_table.php?course_id=922%20U4340&class=&dpt_code=9440&ser_no=32336&semester=111-1&lang=CH
+#
+# GitHub URL:
+# https://github.com/EdwardLeeMacau/ntucsie_adl/blob/master/intent_classification_and_slot_tagging/dataset.py#L69
 class LibriSeqDataset(Dataset):
     IGN = -1
 

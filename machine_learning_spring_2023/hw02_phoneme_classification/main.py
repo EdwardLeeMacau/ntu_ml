@@ -1,5 +1,6 @@
 import argparse
 import json
+import os
 from typing import Dict
 
 import torch
@@ -16,15 +17,21 @@ from utils import _optimizer, _scheduler, flatten, same_seeds
 with open('params.yaml', 'r') as f:
     hparams = yaml.load(f, Loader=yaml.FullLoader)
 
+# dataset
+dataset_dir = hparams['env']['dataset']
+
+# store dir
+checkpoint_dir = hparams['env']['checkpoint']
+
 n_frames = hparams['model']['n-frames'] # the number of frames to concat with, n must be odd (total 2k+1 = n frames)
 train_ratio = hparams['ratio']          # the ratio of data used for training, the rest will be used for validation
 
 # training parameters
-seed = hparams['seed']                  # random seed
-batch_size = hparams['batch-size']      # batch size
-num_epoch = hparams['epochs']           # the number of training epoch
-model_path = './model.ckpt'             # the path where the checkpoint will be saved
-last_model_path = './model_end.ckpt'    # the path where the last iterated model will be saved
+seed = hparams['seed']                                                  # random seed
+batch_size = hparams['batch-size']['train']                             # batch size
+num_epoch = hparams['epochs']                                           # the number of training epoch
+model_path = os.path.join(checkpoint_dir, 'model.ckpt')                 # the path where the checkpoint will be saved
+# last_model_path = os.path.join(checkpoint_dir, './model_end.ckpt')    # the path where the last iterated model will be saved
 
 optimizer_params = hparams['optimizer']
 optimizer_kwargs = optimizer_params['kwargs']
@@ -43,8 +50,8 @@ device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 def get_loader(splits=[TRAIN, VAL]) -> Dict[str, DataLoader]:
     kwargs = {
-        'feature_dir': './libriphone/feat',
-        'phone_path': './libriphone',
+        'feature_dir': f'{dataset_dir}/feat',
+        'phone_path': dataset_dir,
         'concat_nframes': n_frames,
         'train_ratio': train_ratio,
         'random_seed': seed
@@ -75,9 +82,8 @@ def train():
 
     del scheduler_params['kwargs']['step_unit']
 
-    # create logger, log hparams first
+    # create logger
     writer = SummaryWriter()
-    writer.add_hparams(flatten(hparams), metric_dict={})
 
     # create model, define a loss function, and optimizer
     model = SeqTagger(**model_params).to(device)
@@ -118,7 +124,7 @@ def train():
             y, pred = y[mask], pred[mask]
             accuracy = (pred.detach() == y.detach()).sum().item() / size
 
-            # log to tensorboard
+            # record the loss and accuracy.
             n_iter = epoch * len(dataloader[TRAIN]) + i
             writer.add_scalar('Loss/train', loss.item(), n_iter)
             writer.add_scalar('Accuracy/train', accuracy, n_iter)
@@ -174,12 +180,15 @@ def train():
         pass
 
     # TODO: handle case with size of validation set is 0 (Train without validation set)
-    model = model.cpu()
-    torch.save(model.state_dict(), last_model_path)
+    # model = model.cpu()
+    # torch.save(model.state_dict(), last_model_path)
 
     with open('metrics.json', 'w') as f:
         json.dump({ 'accuracy': best_acc, 'loss': best_loss }, f)
 
+    writer.add_hparams(
+        flatten(hparams), metric_dict={'hparam/accuracy': best_acc, 'hparam/loss': best_loss }
+    )
 
 @torch.no_grad()
 def test():
