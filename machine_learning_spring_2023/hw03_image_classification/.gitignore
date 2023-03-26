@@ -10,5 +10,6 @@ ml2023spring-hw3.zip
 
 # Generated file
 *.csv
+*.png
 /metrics.json
 /runs

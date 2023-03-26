@@ -6,12 +6,18 @@ from torch.optim import Adam, RAdam, SGD
 from typing import Dict
 
 
-""" Mapping table, to convert string as scheduler constructor. """
+""" Mapping table, to convert string as scheduler constructor.
+
+Reference: https://pytorch.org/docs/stable/optim.html#how-to-adjust-learning-rate
+"""
 _scheduler = {
     'StepLR': StepLR,
 }
 
-""" Mapping table, to convert string as optimizer constructor. """
+""" Mapping table, to convert string as optimizer constructor.
+
+Reference: https://pytorch.org/docs/stable/optim.html
+"""
 _optimizer = {
     'Adam': Adam,
     'RAdam': RAdam,
@@ -40,4 +46,8 @@ def flatten(param: Dict, prefix: str = ""):
     return retval
 
 def count_parameters(model: torch.nn.Module):
+    """ Return number of trainable parameters in a torch model.
+
+    Reference: https://discuss.pytorch.org/t/how-do-i-check-the-number-of-parameters-of-a-model/4325/9
+    """
     return sum(p.numel() for p in model.parameters() if p.requires_grad)

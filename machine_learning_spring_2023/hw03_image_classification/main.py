@@ -8,7 +8,9 @@ If you have any questions, please contact the TAs via TA hours, NTU COOL, or ema
 """
 
 import argparse
-import random
+import json
+import os
+import uuid
 
 import numpy as np
 import pandas as pd
@@ -17,225 +19,283 @@ import torch.nn as nn
 import torchvision.transforms as transforms
 import yaml
 from dataset import FoodDataset
-from model import Classifier
-import json
+from model import GaussianNoise
+from PIL import Image
+from sklearn.metrics import confusion_matrix
+from torch.cuda.amp import GradScaler, autocast
 # "ConcatDataset" and "Subset" are possibly useful when doing semi-supervised learning.
 from torch.utils.data import ConcatDataset, DataLoader, Dataset, Subset
+from torch.utils.tensorboard import SummaryWriter
+from torchvision import models
 from torchvision.datasets import DatasetFolder, VisionDataset
 from tqdm import tqdm
-# This is for the progress bar.
 from tqdm.auto import tqdm
-
-seed = 6666  # set a random seed for reproducibility
-
-def same_seeds(seed):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-    torch.backends.cudnn.benchmark = False
-    torch.backends.cudnn.deterministic = True
+from utils import (ModelCheckpointPreserver, _optimizer, _scheduler, flatten, mixup, sizeof_fmt,
+                   plot_confusion_matrix, same_seeds)
+from visualize import visualize_representation
 
 """# Configurations"""
 with open('params.yaml', 'r') as f:
-    params = yaml.load(f, Loader=yaml.FullLoader)
+    hparams = yaml.load(f, Loader=yaml.FullLoader)
+
+# dataset
+dataset_dir = hparams['env']['dataset']
 
 # "cuda" only when GPUs are available.
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 # Initialize a model, and put it on the device specified.
-model = Classifier().to(device)
+#
+# Initialize residual from zero leads slightly performance improvement
+# To use this feature, set argument zero_init_residual as True
+# https://arxiv.org/pdf/1706.02677.pdf
+model = models.resnet34(num_classes=11, weights=None, progress=None, zero_init_residual=False)
+model = model.to(device)
 
 # The number of batch size.
-# batch_size = 64
-batch_size = params['tuning']['batch-size']
-image_size = tuple(params['model']['resize'])
+seed = hparams['seed']
+img_size = tuple(hparams['model']['resize'])
+batch_size = hparams['batch-size']
 
 # The number of training epochs.
-n_epochs = params['epochs']
-weight_decay = params['tuning']['weight-decay']
-learning_rate = params['tuning']['learning-rate']
+n_epochs = hparams['epochs']
+
+# Config for mixup augmentation
+use_mixup = hparams['mixup']['enable']
+alpha = hparams['mixup']['alpha']
 
 # If no improvement in 'patience' epochs, early stop.
-patience = 5
+patience = hparams['early-stop']
 
 # For the classification task, we use cross-entropy as the measurement of performance.
-criterion = nn.CrossEntropyLoss()
-
-# Initialize optimizer, you may fine-tune some hyperparameters such as learning rate on your own.
-optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+#
+# Replace CrossEntropy by BCEWithLogitsLoss to have better flexibility
+# https://pytorch.org/docs/stable/generated/torch.nn.BCEWithLogitsLoss.html
+criterion = nn.BCEWithLogitsLoss()
 
 same_seeds(seed)
-"""# Dataloader"""
 
+# Reference: https://pytorch.org/vision/stable/transforms.html
 # Normally, We don't need augmentations in testing and validation.
 # All we need here is to resize the PIL image and transform it into Tensor.
 test_tfm = transforms.Compose([
-    transforms.Resize(image_size),
+    transforms.Resize(img_size),
     transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
 ])
 
 # However, it is also possible to use augmentation in the testing phase.
 # You may use train_tfm to produce a variety of images and then test using ensemble methods
-# a possible solution: AutoAugment(AutoAugmentPolicy.IMAGENET)
 train_tfm = transforms.Compose([
     # Resize the image into a fixed shape (height = width = 128)
-    transforms.Resize(image_size),
+    transforms.Resize(img_size),
     # You may add some transforms here.
-    transforms.GaussianBlur(5),
-    transforms.ColorJitter(brightness=0.5, contrast=0.5, saturation=0.5, hue=0.5),
+    transforms.RandomResizedCrop(img_size, scale=(0.75, 1.0)),
+    transforms.GaussianBlur(13),
+    transforms.ColorJitter(brightness=0.5, contrast=0.5, saturation=0.5),
     transforms.RandomHorizontalFlip(p=0.5),
-    transforms.RandomPerspective(distortion_scale=0.8, p=0.5),
-    transforms.RandomRotation(degrees=(-15, 15)),
+    transforms.RandomPerspective(distortion_scale=0.2, p=0.5),
     transforms.RandomPosterize(bits=2),
     # ToTensor() should be the last one of the transforms.
     transforms.ToTensor(),
+    transforms.RandomErasing(p=0.5, scale=(0.02, 0.15), value=0),
+    GaussianNoise(mean=0, sigma=(0.01, 0.1)),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
 ])
 
 def train():
     # Construct train and valid datasets.
     # The argument "loader" tells how torchvision reads the data.
-    train_set = FoodDataset("./data/train", transform=train_tfm)
+    train_set = FoodDataset(f"{dataset_dir}/train", transform=train_tfm)
     train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=8, pin_memory=True)
-    valid_set = FoodDataset("./data/valid", transform=test_tfm)
-    valid_loader = DataLoader(valid_set, batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=True)
+    valid_set = FoodDataset(f"{dataset_dir}/valid", transform=test_tfm)
+    valid_loader = DataLoader(valid_set, batch_size=batch_size, shuffle=False, num_workers=8, pin_memory=True)
+
+    optimizer_params = hparams['optimizer']
+    optimizer_kwargs = optimizer_params['kwargs']
+
+    scheduler_params = hparams['scheduler']
+    scheduler_kwargs = scheduler_params['kwargs']
+
+    if scheduler_params['kwargs']['step_unit'] == "epoch":
+        scheduler_params['kwargs']['step_size'] *= len(train_loader)
+
+    del scheduler_params['kwargs']['step_unit']
+
+    # Create logger
+    writer = SummaryWriter()
+
+    # Imply mixup if enabled
+    mx = (lambda x: mixup(x, alpha=alpha)) if use_mixup else (lambda x: x)
+
+    # Create utilities
+    # Automatic Mixed Precision: https://pytorch.org/docs/stable/amp.html#torch.autocast
+    scaler = GradScaler()
+
+    # store dir
+    checkpoint_dir = os.path.join(hparams['env']['checkpoint'], str(uuid.uuid1()))
+    os.makedirs(checkpoint_dir)
+    preserver = ModelCheckpointPreserver(key='accuracy', k=hparams['env']['k-max-ckpt'], dirname=checkpoint_dir)
+
+    # Initialize optimizer, you may fine-tune some hyperparameters such as learning rate on your own.
+    optimizer = _optimizer[optimizer_params['name']](model.parameters(), **optimizer_kwargs)
+    scheduler = _scheduler[scheduler_params['name']](optimizer, **scheduler_kwargs)
+
+    progress_bar = tqdm(total=n_epochs * len(train_loader), desc='Training: ')
 
     """# Start Training"""
 
     # Initialize trackers, these are not parameters and should not be changed
     stale = 0
-    best_acc = 0
 
+    valid_acc, valid_loss = 0.0, float('inf')
     for epoch in range(n_epochs):
-        # ---------- Training ----------
-        # Make sure the model is in train mode before training.
+        # ------------------------------ Training ------------------------------
         model.train()
 
         # These are used to record information in training.
-        train_loss = []
-        train_accs = []
+        for i, batch in enumerate(train_loader):
+            x, y = mx(batch)
+            x, y = x.to(device), y.to(device)
 
-        for batch in tqdm(train_loader):
-            # A batch consists of image data and corresponding labels.
-            imgs, labels = batch
-
-            # Forward the data. (Make sure data and model are on the same device.)
-            logits = model(imgs.to(device))
-
-            # Calculate the cross-entropy loss.
-            # We don't need to apply softmax before computing cross-entropy as it is done automatically.
-            loss = criterion(logits, labels.to(device))
+            # Forward the data.
+            # with autocast():
+            logits = model(x)
+            loss = criterion(logits, y)
 
             # Gradients stored in the parameters in the previous step should be cleared out first.
             optimizer.zero_grad()
 
             # Compute the gradients for parameters.
+            # scaler.scale(loss).backward()
             loss.backward()
 
             # Clip the gradient norms for stable training.
             grad_norm = nn.utils.clip_grad_norm_(model.parameters(), max_norm=10)
 
             # Update the parameters with computed gradients.
+            # scaler.step(optimizer)
+            # scaler.update()
             optimizer.step()
+            scheduler.step()
 
             # Compute the accuracy for current batch.
-            acc = (logits.argmax(dim=-1) == labels.to(device)).float().mean()
+            acc = (logits.argmax(dim=-1) == y.argmax(dim=-1)).float().mean()
 
-            # Record the loss and accuracy.
-            train_loss.append(loss.item())
-            train_accs.append(acc)
+            # record the loss and accuracy.
+            n_iter = epoch * len(train_loader) + i
+            writer.add_scalar('Loss/train', loss.item(), n_iter)
+            writer.add_scalar('Accuracy/train', acc.item(), n_iter)
 
-        train_loss = sum(train_loss) / len(train_loss)
-        train_acc = sum(train_accs) / len(train_accs)
+            postfix = {
+                'acc': valid_acc,
+                'loss': valid_loss,
+                'memusage': sizeof_fmt(torch.cuda.max_memory_allocated()),
+                'nextval': len(train_loader) - i - 1,
+            }
+            progress_bar.update()
+            progress_bar.set_postfix(**postfix)
 
-        # Print the information.
-        print(f"[ Train | {epoch + 1:03d}/{n_epochs:03d} ] loss = {train_loss:.5f}, acc = {train_acc:.5f}")
-
-        # ---------- Validation ----------
-        # Make sure the model is in eval mode so that some modules like dropout are disabled and work normally.
+        # ------------------------------ Validation ------------------------------
         model.eval()
 
         # These are used to record information in validation.
         valid_loss = []
         valid_accs = []
+        prediction = []
+        ground_truth = []
 
         # Iterate the validation set by batches.
-        for batch in tqdm(valid_loader):
+        with torch.no_grad():
+            for batch in valid_loader:
+                x, y = batch
 
-            # A batch consists of image data and corresponding labels.
-            imgs, labels = batch
-            #imgs = imgs.half()
+                x, y = x.to(device), y.to(device)
+                logits = model(x)
 
-            # We don't need gradient in validation.
-            # Using torch.no_grad() accelerates the forward process.
-            with torch.no_grad():
-                logits = model(imgs.to(device))
+                # compute the loss.
+                loss = criterion(logits, y)
+                pred = np.argmax(logits.cpu().data.numpy(), axis=1)
 
-            # We can still compute the loss (but not the gradient).
-            loss = criterion(logits, labels.to(device))
+                # compute the metrics for current batch.
+                prediction += pred.squeeze().tolist()
+                ground_truth += y.argmax(dim=-1).cpu().tolist()
+                acc = (logits.argmax(dim=-1) == y.argmax(dim=-1)).float().mean()
 
-            # Compute the accuracy for current batch.
-            acc = (logits.argmax(dim=-1) == labels.to(device)).float().mean()
-
-            # Record the loss and accuracy.
-            valid_loss.append(loss.item())
-            valid_accs.append(acc)
-            #break
+                # record the loss and accuracy.
+                valid_loss.append(loss.item())
+                valid_accs.append(acc.item())
 
         # The average loss and accuracy for entire validation set is the average of the recorded values.
         valid_loss = sum(valid_loss) / len(valid_loss)
         valid_acc = sum(valid_accs) / len(valid_accs)
 
-        # Print the information.
-        print(f"[ Valid | {epoch + 1:03d}/{n_epochs:03d} ] loss = {valid_loss:.5f}, acc = {valid_acc:.5f}")
+        # cm = confusion_matrix(ground_truth, prediction)
+        # cm_img = np.array(
+        #     Image.open(plot_confusion_matrix(cm, list(range(11)))).convert("RGB")
+        # ).transpose(2, 0, 1)
 
-        # save models
-        if valid_acc > best_acc:
-            print(f"Best model found at epoch {epoch}, saving model")
-            torch.save(model.state_dict(), f"model.ckpt") # only save best to prevent output memory exceed error
-            best_acc = valid_acc
-            stale = 0
-        else:
-            stale += 1
-            if stale > patience:
-                print(f"No improvement {patience} consecutive epochs, early stopping")
-                break
+        # record the loss and accuracy.
+        n_iter = (epoch + 1) * len(train_loader)
+        writer.add_scalar('Loss/validation', valid_loss, n_iter)
+        writer.add_scalar('Accuracy/validation', valid_acc, n_iter)
+        # writer.add_image('ConfusionMatrix/validation', cm_img, n_iter)
 
+        # save model if it performs well in validation set.
+        stale = 0 if preserver.update(model, valid_acc, n_iter) else (stale + 1)
+        if stale > patience:
+            break
+
+    best_iter, best_acc = preserver.get_best()
     with open('metrics.json', 'w') as f:
-        json.dump({ 'accuracy': best_acc.item() }, f)
+        json.dump({ 'accuracy': best_acc }, f)
 
-def test():
+    del hparams['env']['checkpoint']
+    del hparams['env']['dataset']
+    del hparams['env']['k-max-ckpt']
+    del hparams['model']['resize']
+    writer.add_hparams(
+        flatten(hparams), metric_dict={'hparam/accuracy': best_acc }
+    )
+
+    # TODO: Enable t-SNE visualization for debugging
+    best_model_dir = os.path.join(checkpoint_dir, f"model-{best_iter:08d}.pt")
+    tsne = np.array(Image.open(visualize_representation(best_model_dir)).convert("RGB"))
+    writer.add_image('t-SNE/validation', tsne)
+
+@torch.no_grad()
+def test(fpath: str):
     # Construct test datasets.
     # The argument "loader" tells how torchvision reads the data.
-    test_set = FoodDataset("data/test", transform=test_tfm)
+    test_set = FoodDataset(f"{dataset_dir}/test", transform=test_tfm)
     test_loader = DataLoader(test_set, batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=True)
 
-    model_best = Classifier().to(device)
-    model_best.load_state_dict(torch.load(f"model.ckpt"))
-    model_best.eval()
+    model = models.resnet34(num_classes=11, weights=None, progress=None)
+    model.load_state_dict(torch.load(fpath))
+    model.to(device)
+    model.eval()
+
     prediction = []
-    with torch.no_grad():
-        for data,_ in tqdm(test_loader):
-            test_pred = model_best(data.to(device))
-            test_label = np.argmax(test_pred.cpu().data.numpy(), axis=1)
-            prediction += test_label.squeeze().tolist()
+    for x, _ in tqdm(test_loader, desc="Inferring: "):
+        test_pred = model(x.to(device))
+        test_label = np.argmax(test_pred.cpu().data.numpy(), axis=1)
+        prediction += test_label.squeeze().tolist()
 
     # create test csv
     def pad4(i):
-        return "0"*(4-len(str(i)))+str(i)
+        return "0" * (4 - len(str(i))) + str(i)
+
     df = pd.DataFrame()
     df["Id"] = [pad4(i) for i in range(len(test_set))]
     df["Category"] = prediction
-    df.to_csv("submission.csv",index = False)
+    df.to_csv("submission.csv", index = False)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
     parser.add_argument('--train', action="store_true")
     parser.add_argument('--test', action='store_true')
+    parser.add_argument('--load-ckpt', type=str, help="load target checkpoint.")
 
     args = parser.parse_args()
 
@@ -243,4 +303,4 @@ if __name__ == "__main__":
         train()
 
     if args.test:
-        test()
+        test(args.load_ckpt)

@@ -83,6 +83,7 @@ def train():
     del scheduler_params['kwargs']['step_unit']
 
     # create logger
+    # Reference: https://pytorch.org/docs/stable/tensorboard.html
     writer = SummaryWriter()
 
     # create model, define a loss function, and optimizer
