@@ -1,0 +1,21 @@
+env:
+  dataset: /tmp2/edwardlee/voxceleb2
+  checkpoint: /tmp2/edwardlee/voxceleb2-ckpt
+  k-max-ckpt: 5
+epochs: 1024
+optimizer:
+  name: AdamW
+  kwargs:
+    lr: 1.0e-3
+    weight_decay: 0
+batch-size: 32
+seed: 87
+scheduler:
+  name: StepLR
+  kwargs:
+    gamma: 0.1
+    step_size: 1024
+    step_unit: epoch
+early-stop: 1024
+model:
+  resize: [224, 224]
