@@ -8,10 +8,13 @@ optimizer:
   kwargs:
     lr: 1.0e-4
     weight_decay: 1.0e-4
-batch-size: 256
+batch-size: 128
 mixup:
   enable: true
   alpha: 0.4
+test-time-augmentation:
+  weight: 0.2
+  candidates: 5
 seed: 6666
 scheduler:
   name: StepLR

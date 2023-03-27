@@ -1,11 +1,13 @@
-import torch
 import os
-from utils import mixup, same_seeds
+
+import torch
 from PIL import Image
 from torch.nn import functional as F
 from torchvision import transforms
+from utils import mixup, same_seeds
 
-def main():
+
+def test_mixup():
     same_seeds(3407)
 
     transform = transforms.Compose([
@@ -37,4 +39,4 @@ def main():
     return
 
 if __name__ == "__main__":
-    main()
+    test_mixup()

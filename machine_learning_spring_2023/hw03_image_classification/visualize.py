@@ -5,27 +5,26 @@ both top & mid layers (You need to submit 2 images).
 """
 
 import argparse
+import io
+import random
+from collections import defaultdict
 
 import matplotlib.cm as cm
 import numpy as np
 import torch
 import yaml
-import random
-import io
-from PIL import Image
-from torch import nn
 from dataset import FoodDataset
-from collections import defaultdict
 from matplotlib import pyplot as plt
 from model import GaussianNoise
+from PIL import Image
 from sklearn.manifold import TSNE
+from torch import nn
 from torch.utils.data import DataLoader
-from torchvision import models, transforms
-from tqdm.auto import tqdm
-from utils import same_seeds, sizeof_fmt, mixup
-from torchvision.utils import make_grid
 from torch.utils.tensorboard import SummaryWriter
-
+from torchvision import models, transforms
+from torchvision.utils import make_grid
+from tqdm.auto import tqdm
+from utils import mixup, same_seeds, sizeof_fmt
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
@@ -56,7 +55,7 @@ def visualize_transform():
         GaussianNoise(mean=0, sigma=(0.01, 0.1)),
         # transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
-    dataset = FoodDataset(f"{dataset_dir}/train", transform=transform)
+    dataset = FoodDataset(f"{dataset_dir}/train", split='train', transform=transform)
 
     writer = SummaryWriter(f'runs/transform')
 
@@ -85,14 +84,14 @@ def visualize_dataset():
         transforms.Resize(img_size),
         transforms.ToTensor(),
     ])
-    dataset = FoodDataset(f"{dataset_dir}/valid", transform=transform)
+    dataset = FoodDataset(f"{dataset_dir}/train", split='train', transform=transform)
 
     writer = SummaryWriter(f'runs/dataset')
     files = defaultdict(list)
-    for f in dataset.files:
-        label = int(f.split("/")[-1].split("_")[0])
-        files[label].append(f)
+    for fname, label in dataset.instances:
+        files[label].append(fname)
 
+    print(dataset.statistics())
     for k, v in files.items():
         print(f'{k:02d}: {len(v)}')
 
@@ -103,7 +102,7 @@ def visualize_dataset():
             batch[idx] = transform(Image.open(files[i][j]))
     batch = make_grid(batch, nrow=5)
 
-    writer.add_image('dataset/val', batch, 0)
+    writer.add_image('dataset/train', batch, 0)
     writer.close()
 
 @torch.no_grad()
@@ -143,7 +142,8 @@ def visualize_representation(fpath: str) -> io.BytesIO:
 
     # Load the validation set
     valid_loader = DataLoader(
-        FoodDataset(f"{dataset_dir}/valid", transform=transform), batch_size=512, num_workers=8, pin_memory=True
+        FoodDataset(f"{dataset_dir}/valid", split='val', transform=transform),
+        batch_size=512, num_workers=8, pin_memory=True
     )
 
     # Extract the representations for the specific layer of model

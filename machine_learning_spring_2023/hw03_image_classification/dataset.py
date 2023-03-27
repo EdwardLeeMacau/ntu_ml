@@ -1,36 +1,58 @@
 import os
+from typing import Callable, Dict, Optional
+from collections import Counter
 
 import torch
-import torchvision.transforms as transforms
-from torch.nn import functional as F
 from PIL import Image
-from torch.utils.data import Dataset
+from torch.nn import functional as F
+from torch.utils.data import Dataset, Sampler, WeightedRandomSampler
 
 
 class FoodDataset(Dataset):
-    def __init__(self, path, transform):
-        # The data is labelled by the name, so we load images and label while calling '__getitem__'
+    def __init__(self, root: str, split: str = "train", transform: Optional[Callable] = None):
         super(FoodDataset).__init__()
 
+        files = sorted([os.path.join(root, x) for x in os.listdir(root) if x.endswith(".jpg")])
+        # Test set has no label, a dummy variable only.
+        if split in ("train", "val"):
+            label = [int(os.path.basename(f).split('_')[0]) for f in files]
+        else:
+            label = [0 for _ in range(len(files))]
+
+        self.split = split
+        self.instances = list(zip(files, label))
+        self.transform = transform
         self.num_classes = 11
 
-        self.files = sorted([os.path.join(path, x) for x in os.listdir(path) if x.endswith(".jpg")])
-        self.transform = transform
+    def statistics(self) -> Dict:
+        if self.split not in ("train", "val"):
+            raise ValueError
+
+        counter = Counter()
+        for _, c in self.instances:
+            counter[c] += 1
+
+        return counter
+
+    def sampler(self) -> Sampler:
+        average_instances = len(self.instances) / 11
+
+        weight = {k: average_instances / v for k, v in self.statistics().items()}
+        sample_weight = [weight.get(l, 1) for _, l in self.instances]
+        return WeightedRandomSampler(sample_weight, num_samples=len(self.instances))
 
     def __len__(self):
-        return len(self.files)
+        return len(self.instances)
 
     def __getitem__(self, idx):
-        fname = self.files[idx]
-        im = Image.open(fname)
-        im = self.transform(im)
+        fname, label = self.instances[idx]
 
-        fname = os.path.basename(fname)
-        if (underscore := fname.find('_')) == -1:
-            # Test set has no label, a dummy variable only.
-            onehot = 0
-        else:
-            label = torch.tensor(int(fname[:underscore]), dtype=torch.long)
-            onehot = F.one_hot(label, self.num_classes).type(torch.float)
+        im = Image.open(fname)
+        if self.transform is not None:
+            im = self.transform(im)
+
+        # Onehot as float to allow label smoothing, mixup operations....
+        label = torch.tensor(label, dtype=torch.long)
+        onehot = F.one_hot(label, self.num_classes).type(torch.float)
 
         return im, onehot

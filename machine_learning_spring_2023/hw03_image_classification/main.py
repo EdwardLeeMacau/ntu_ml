@@ -1,12 +1,3 @@
-# -*- coding: utf-8 -*-
-"""ML2023Spring - HW3
-# HW3 Image Classification
-
-## We strongly recommend that you run with [Kaggle](https://www.kaggle.com/t/86ca241732c04da99aca6490080bae73) for this homework
-
-If you have any questions, please contact the TAs via TA hours, NTU COOL, or email to mlta-2023-spring@googlegroups.com
-"""
-
 import argparse
 import json
 import os
@@ -30,8 +21,8 @@ from torchvision import models
 from torchvision.datasets import DatasetFolder, VisionDataset
 from tqdm import tqdm
 from tqdm.auto import tqdm
-from utils import (ModelCheckpointPreserver, _optimizer, _scheduler, flatten, mixup, sizeof_fmt,
-                   plot_confusion_matrix, same_seeds)
+from utils import (ModelCheckpointPreserver, _optimizer, _scheduler, flatten,
+                   mixup, plot_confusion_matrix, same_seeds, sizeof_fmt)
 from visualize import visualize_representation
 
 """# Configurations"""
@@ -46,10 +37,11 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 
 # Initialize a model, and put it on the device specified.
 #
-# Initialize residual from zero leads slightly performance improvement
-# To use this feature, set argument zero_init_residual as True
+# For ResNet family, initialize residual from zero leads slightly
+# performance improvement. To use this feature, set argument
+# zero_init_residual as True.
 # https://arxiv.org/pdf/1706.02677.pdf
-model = models.resnet34(num_classes=11, weights=None, progress=None, zero_init_residual=False)
+model = models.resnet50(num_classes=11, weights=None, progress=None)
 model = model.to(device)
 
 # The number of batch size.
@@ -78,7 +70,7 @@ same_seeds(seed)
 # Reference: https://pytorch.org/vision/stable/transforms.html
 # Normally, We don't need augmentations in testing and validation.
 # All we need here is to resize the PIL image and transform it into Tensor.
-test_tfm = transforms.Compose([
+validation_transform = transforms.Compose([
     transforms.Resize(img_size),
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
@@ -86,7 +78,7 @@ test_tfm = transforms.Compose([
 
 # However, it is also possible to use augmentation in the testing phase.
 # You may use train_tfm to produce a variety of images and then test using ensemble methods
-train_tfm = transforms.Compose([
+train_transform = transforms.Compose([
     # Resize the image into a fixed shape (height = width = 128)
     transforms.Resize(img_size),
     # You may add some transforms here.
@@ -95,7 +87,7 @@ train_tfm = transforms.Compose([
     transforms.ColorJitter(brightness=0.5, contrast=0.5, saturation=0.5),
     transforms.RandomHorizontalFlip(p=0.5),
     transforms.RandomPerspective(distortion_scale=0.2, p=0.5),
-    transforms.RandomPosterize(bits=2),
+    transforms.RandomPosterize(bits=4, p=0.5),
     # ToTensor() should be the last one of the transforms.
     transforms.ToTensor(),
     transforms.RandomErasing(p=0.5, scale=(0.02, 0.15), value=0),
@@ -106,9 +98,9 @@ train_tfm = transforms.Compose([
 def train():
     # Construct train and valid datasets.
     # The argument "loader" tells how torchvision reads the data.
-    train_set = FoodDataset(f"{dataset_dir}/train", transform=train_tfm)
+    train_set = FoodDataset(f"{dataset_dir}/train", split="train", transform=train_transform)
     train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=8, pin_memory=True)
-    valid_set = FoodDataset(f"{dataset_dir}/valid", transform=test_tfm)
+    valid_set = FoodDataset(f"{dataset_dir}/valid", split="val", transform=validation_transform)
     valid_loader = DataLoader(valid_set, batch_size=batch_size, shuffle=False, num_workers=8, pin_memory=True)
 
     optimizer_params = hparams['optimizer']
@@ -265,29 +257,74 @@ def train():
 
 @torch.no_grad()
 def test(fpath: str):
-    # Construct test datasets.
+    # Construct datasets.
     # The argument "loader" tells how torchvision reads the data.
-    test_set = FoodDataset(f"{dataset_dir}/test", transform=test_tfm)
-    test_loader = DataLoader(test_set, batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=True)
+    deterministic_transform = transforms.Compose([
+        transforms.Resize(img_size),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
 
-    model = models.resnet34(num_classes=11, weights=None, progress=None)
+    diversified_transform = transforms.Compose([
+        # Resize the image into a fixed shape (height = width = 128)
+        transforms.Resize(img_size),
+        # You may add some transforms here.
+        transforms.RandomResizedCrop(img_size, scale=(0.75, 1.0)),
+        transforms.GaussianBlur(13),
+        transforms.ColorJitter(brightness=0.5, contrast=0.5, saturation=0.5),
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.RandomPerspective(distortion_scale=0.2, p=0.5),
+        transforms.RandomPosterize(bits=2),
+        # ToTensor() should be the last one of the transforms.
+        transforms.ToTensor(),
+        # transforms.RandomErasing(p=0.5, scale=(0.02, 0.15), value=0),
+        GaussianNoise(mean=0, sigma=(0.01, 0.1)),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
+
+    dataset = FoodDataset(f"{dataset_dir}/test", split="test", transform=deterministic_transform)
+    dataloader = DataLoader(dataset, batch_size=1, num_workers=8, pin_memory=True)
+
+    # Setup model.
+    model = models.resnet50(num_classes=11, weights=None, progress=None)
     model.load_state_dict(torch.load(fpath))
     model.to(device)
     model.eval()
 
-    prediction = []
-    for x, _ in tqdm(test_loader, desc="Inferring: "):
-        test_pred = model(x.to(device))
-        test_label = np.argmax(test_pred.cpu().data.numpy(), axis=1)
-        prediction += test_label.squeeze().tolist()
+    # Utility
+    sigmoid = nn.Sigmoid()
+
+    # Deterministic part
+    deterministic_prob = np.empty((len(dataset), 11))
+    for i, (x, _) in enumerate(tqdm(dataloader, desc='Inferring (deterministic)')):
+        deterministic_prob[i] = sigmoid(model(x.to(device))).cpu().data.numpy()
+
+    # Probabilistic part
+    dataset.transform = diversified_transform
+    dataloader = DataLoader(dataset, batch_size=1, num_workers=8, pin_memory=True)
+
+    probabilistic_prob = np.empty((hparams['test-time-augmentation']['candidates'], len(dataset), 11))
+    for c in range(hparams['test-time-augmentation']['candidates']):
+        for i, (x, _) in enumerate(tqdm(dataloader, desc='Inferring (augmentation)')):
+            probabilistic_prob[c][i] = sigmoid(model(x.to(device))).cpu().data.numpy()
+    probabilistic_prob = np.mean(probabilistic_prob, axis=0)
+
+    # Weight averaged prob to and select label
+    w = hparams['test-time-augmentation']['weight']
+    prob = w * probabilistic_prob + (1 - w) * deterministic_prob
+    label = np.argmax(prob, axis=1).squeeze().tolist()
+
+    # Study how TTA affects accuracy
+    # diff = np.mean(np.abs(deterministic_prob - probabilistic_prob), axis=0)
+    # print(f"{diff=}")
 
     # create test csv
     def pad4(i):
         return "0" * (4 - len(str(i))) + str(i)
 
     df = pd.DataFrame()
-    df["Id"] = [pad4(i) for i in range(len(test_set))]
-    df["Category"] = prediction
+    df["Id"] = [pad4(i) for i in range(len(dataset))]
+    df["Category"] = label
     df.to_csv("submission.csv", index = False)
 
 if __name__ == "__main__":

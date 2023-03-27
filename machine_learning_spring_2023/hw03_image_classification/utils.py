@@ -1,13 +1,14 @@
+import io
+import itertools
+import os
 import random
+from typing import Dict, Tuple
+
 import numpy as np
 import torch
-import os
-import io
-from torch.optim.lr_scheduler import StepLR
-from torch.optim import Adam, RAdam, SGD
-from typing import Dict, Tuple
 from matplotlib import pyplot as plt
-import itertools
+from torch.optim import SGD, Adam, RAdam
+from torch.optim.lr_scheduler import StepLR
 
 """ Mapping table, to convert string as scheduler constructor.
 
@@ -26,10 +27,6 @@ _optimizer = {
     'RAdam': RAdam,
     'SGD': SGD,
 }
-
-# TODO: Logger which adapts Google Colab, Kaggle, and server
-class Logger:
-    pass
 
 def argmin(d: Dict):
     val = min(d.values())
@@ -50,7 +47,6 @@ def sizeof_fmt(num, suffix="B") -> str:
         num /= 1024.0
     return f"{num:.1f}Yi{suffix}"
 
-# TODO: support mixup augmentation
 # Reference:
 #
 # https://arxiv.org/pdf/1710.09412.pdf
