@@ -4,6 +4,7 @@ import random
 from pathlib import Path
 
 import torch
+from typing import Tuple, List
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import Dataset
 
@@ -37,26 +38,33 @@ from torch.utils.data import Dataset
 For efficiency, we segment the mel-spectrograms into segments in the training step.
 """
 
+def metadata(data_dir: str) -> Tuple:
+    data_dir = data_dir
+
+    # Load the mapping from speaker name to their corresponding id.
+    mapping_path = Path(data_dir) / "mapping.json"
+    mapping = json.load(mapping_path.open())
+    speaker2id = mapping["speaker2id"]
+
+    # Load metadata of training data.
+    metadata_path = Path(data_dir) / "metadata.json"
+    metadata = json.load(open(metadata_path))["speakers"]
+
+    # Get the total number of speaker.
+    speaker_num = len(metadata.keys())
+
+    data = []
+    for speaker in metadata.keys():
+        for utterances in metadata[speaker]:
+            data.append([utterances["feature_path"], speaker2id[speaker]])
+
+    return speaker_num, speaker2id, data
+
 class MyDataset(Dataset):
-    def __init__(self, data_dir, segment_len=128):
+    def __init__(self, data_dir: str, data: List, segment_len=128):
         self.data_dir = data_dir
+        self.data = data
         self.segment_len = segment_len
-
-        # Load the mapping from speaker neme to their corresponding id.
-        mapping_path = Path(data_dir) / "mapping.json"
-        mapping = json.load(mapping_path.open())
-        self.speaker2id = mapping["speaker2id"]
-
-        # Load metadata of training data.
-        metadata_path = Path(data_dir) / "metadata.json"
-        metadata = json.load(open(metadata_path))["speakers"]
-
-        # Get the total number of speaker.
-        self.speaker_num = len(metadata.keys())
-        self.data = []
-        for speaker in metadata.keys():
-            for utterances in metadata[speaker]:
-                self.data.append([utterances["feature_path"], self.speaker2id[speaker]])
 
     def __len__(self):
         return len(self.data)
@@ -66,17 +74,20 @@ class MyDataset(Dataset):
         # Load preprocessed mel-spectrogram.
         mel = torch.load(os.path.join(self.data_dir, feat_path))
 
-        # Segmemt mel-spectrogram into "segment_len" frames.
+        # Segment mel-spectrogram into "segment_len" frames.
         if len(mel) > self.segment_len:
             # Randomly get the starting point of the segment.
+            length = self.segment_len
             start = random.randint(0, len(mel) - self.segment_len)
             # Get a segment with "segment_len" frames.
             mel = torch.FloatTensor(mel[start:start+self.segment_len])
         else:
+            length = len(mel)
             mel = torch.FloatTensor(mel)
+
         # Turn the speaker id into long for computing loss later.
         speaker = torch.FloatTensor([speaker]).long()
-        return mel, speaker
+        return mel, length, speaker
 
     def get_speaker_number(self):
         return self.speaker_num
@@ -97,4 +108,4 @@ class InferenceDataset(Dataset):
         feat_path = utterance["feature_path"]
         mel = torch.load(os.path.join(self.data_dir, feat_path))
 
-        return feat_path, mel
+        return feat_path, len(mel), mel

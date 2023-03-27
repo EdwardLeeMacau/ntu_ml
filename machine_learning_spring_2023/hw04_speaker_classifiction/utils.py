@@ -51,7 +51,6 @@ def sizeof_fmt(num, suffix="B") -> str:
         num /= 1024.0
     return f"{num:.1f}Yi{suffix}"
 
-# TODO: support mixup augmentation
 # Reference:
 #
 # https://arxiv.org/pdf/1710.09412.pdf
@@ -72,9 +71,8 @@ def mixup(batch, alpha=0.2, dtype=torch.float) -> Tuple[torch.Tensor, torch.Tens
 
 class ModelCheckpointPreserver:
     """ k-max model preserving """
-    def __init__(self, key: str, k=1, dirname="./"):
+    def __init__(self, k=1, dirname="./"):
         self.k = k
-        self.key = key
         self.dirname = dirname
         self.records = { }
 

@@ -7,13 +7,13 @@
     ```
 
     ```yaml
-    # Assume dataset is stored at /tmp2/food-11, best model is stored at /tmp2/food-11-ckpt
+    # Assume dataset is stored at /tmp2/voxceleb2, best model is stored at /tmp2/voxceleb2-ckpt
     #
     # To avoid file overwriting, uuid1 is used, the checkpoints are store
-    # at /tmp2/food-11-ckpt/<uuid1>/model_<iteration>.pt
+    # at /tmp2/voxceleb2/<uuid1>/model_<iteration>.pt
     env:
-      dataset: /tmp2/food-11
-      checkpoint: /tmp2/food-11-ckpt
+      dataset: /tmp2/voxceleb2
+      checkpoint: /tmp2/voxceleb2-ckpt
     ...
     ```
 

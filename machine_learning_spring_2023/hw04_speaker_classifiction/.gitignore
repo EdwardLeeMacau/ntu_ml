@@ -13,3 +13,4 @@ ml2023springhw4.zip
 *.png
 /metrics.json
 /runs
+.ipynb_checkpoints
