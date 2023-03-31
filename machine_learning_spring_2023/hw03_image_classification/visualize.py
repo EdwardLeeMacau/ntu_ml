@@ -130,8 +130,12 @@ def visualize_representation(fpath: str) -> io.BytesIO:
     # Print entire model structure
     print(model)
 
-    # Remove classification head
+    # Remove classification head to get representation in top-layer
     model.fc = nn.Identity()
+
+    # Remove layer4 to get representation in middle-layer
+    model.layer4 = nn.Identity()
+
     model.eval()
 
     # Define transform
@@ -151,16 +155,17 @@ def visualize_representation(fpath: str) -> io.BytesIO:
     # index = ... # You should find out the index of layer which is defined as "top" or 'mid' layer of your model.
     features = []
     labels = []
-    with tqdm(valid_loader, desc='Validating') as pbar:
+    with tqdm(valid_loader, desc='Validating', ncols=0) as pbar:
         for batch in pbar:
             X, Y = batch
+            Y = torch.argmax(Y, dim=1)
 
-            logits = model(X.to(device))
-            logits = logits.view(logits.size()[0], -1)
+            repr = model(X.to(device))
+            repr = repr.view(repr.size()[0], -1)
             labels.extend(Y.cpu().numpy())
-            logits = np.squeeze(logits.cpu().numpy())
+            repr = np.squeeze(repr.cpu().numpy())
 
-            features.extend(logits)
+            features.extend(repr)
             pbar.set_postfix(MemUsage=sizeof_fmt(torch.cuda.max_memory_allocated()))
 
     features = np.array(features)
