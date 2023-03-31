@@ -8,7 +8,7 @@ import numpy as np
 import torch
 from matplotlib import pyplot as plt
 from torch.optim import SGD, Adam, RAdam
-from torch.optim.lr_scheduler import StepLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, SequentialLR, StepLR
 
 """ Mapping table, to convert string as scheduler constructor.
 
@@ -16,6 +16,8 @@ Reference: https://pytorch.org/docs/stable/optim.html#how-to-adjust-learning-rat
 """
 _scheduler = {
     'StepLR': StepLR,
+    'CosineAnnealingLR': CosineAnnealingLR,
+    'SequentialLR': SequentialLR
 }
 
 """ Mapping table, to convert string as optimizer constructor.
@@ -47,6 +49,9 @@ def sizeof_fmt(num, suffix="B") -> str:
         num /= 1024.0
     return f"{num:.1f}Yi{suffix}"
 
+# See timm (powered by fastai) for 3rd-party implementation:
+# https://timm.fast.ai/mixup_cutmix
+#
 # Reference:
 #
 # https://arxiv.org/pdf/1710.09412.pdf
@@ -65,6 +70,13 @@ def mixup(batch, alpha=0.2, dtype=torch.float) -> Tuple[torch.Tensor, torch.Tens
 
     return (x, y)
 
+# TODO: Combine with cutmix also.
+# Try to apply mixup or cutmix randomly with equal prob.
+# See: https://pytorch.org/blog/how-to-train-state-of-the-art-models-using-torchvision-latest-primitives/#mixup-and-cutmix
+def cutmix():
+    raise NotImplementedError
+
+# See 'torch.utils.checkpoint', 'pytorch_lightning.callbacks.ModelCheckpoint'
 class ModelCheckpointPreserver:
     """ k-max model preserving """
     def __init__(self, key: str, k=1, dirname="./"):

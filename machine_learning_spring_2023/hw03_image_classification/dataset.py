@@ -56,3 +56,30 @@ class FoodDataset(Dataset):
         onehot = F.one_hot(label, self.num_classes).type(torch.float)
 
         return im, onehot
+
+
+def test_trainval_dataset():
+    import yaml
+    import random
+
+    """# Configurations"""
+    with open('params.yaml', 'r') as f:
+        hparams = yaml.load(f, Loader=yaml.FullLoader)
+
+    dataset_dir = hparams['env']['dataset']
+    train_set = FoodDataset(f"{dataset_dir}/train", split="train", transform=None)
+    valid_set = FoodDataset(f"{dataset_dir}/valid", split="val", transform=None)
+
+    instances = []
+
+    # Copy instances and shuffle again
+    instances.extend(train_set.instances)
+    instances.extend(valid_set.instances)
+    random.shuffle(instances)
+
+    # Reassign instance list
+    num = len(train_set)
+    train_set.instances, valid_set.instances = instances[:num], instances[num:]
+
+if __name__ == "__main__":
+    test_trainval_dataset()

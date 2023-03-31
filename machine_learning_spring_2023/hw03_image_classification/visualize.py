@@ -116,12 +116,13 @@ def visualize_representation(fpath: str) -> io.BytesIO:
     with open('params.yaml', 'r') as f:
         hparams = yaml.load(f, Loader=yaml.FullLoader)
 
-    image_size = tuple(hparams['model']['resize'])
+    image_size = hparams['model']['input-size']['test']
+    image_size = (image_size['height'], image_size['width'])
     dataset_dir = hparams['env']['dataset']
 
     # Load the trained model or pass by argument
     state_dict = torch.load(fpath)
-    model = models.resnet34(
+    model = models.resnext101_32x8d(
         num_classes=11, weights=None, progress=None
     ).to(device)
     model.load_state_dict(state_dict)
