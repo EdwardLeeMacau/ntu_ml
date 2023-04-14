@@ -1,30 +1,51 @@
 # How to execute
 
-1. Modify dataset directory and checkpoint saving directory in `params.yaml`.
+1. Prepare fairseq scripts
+
+    ```bash
+    $ git clone https://github.com/pytorch/fairseq.git
+    $ cd fairseq && git checkout 9a1c497
+    $ pip install --upgrade ./fairseq/
+    ```
+
+2. Modify dataset directory and checkpoint saving directory in `params.yaml`.
 
     ```bash
     $ vi params.yaml
     ```
 
     ```yaml
-    # Assume dataset is stored at /tmp2/voxceleb2, best model is stored at /tmp2/voxceleb2-ckpt
-    #
-    # To avoid file overwriting, uuid1 is used, the checkpoints are store
-    # at /tmp2/voxceleb2/<uuid1>/model_<iteration>.pt
+    # Assume raw dataset is stored at /tmp2/ted2020
+    # tokenize dataset is store at /tmp2/ted2020-bin
+    # model checkpoints are stored at ./checkpoints/rnn
     env:
-      dataset: /tmp2/voxceleb2
-      checkpoint: /tmp2/voxceleb2-ckpt
+      dataset: /tmp2/ted2020
+      binarized: /tmp2/ted2020-bin
+      checkpoint: ./checkpoints/rnn
     ...
     ```
 
-2. Execute `main.py` with option `--train` to train a model from stretch.
+3. Execute `preprocess.py` to split the dataset into training, validation and test set. Then execute preprocessor implemented by fairseq to tokenize data.
 
     ```bash
-    $ python main.py --train
+    $ python preprocess.py
+    $ python -m fairseq_cli.preprocess --source-lang en --target-lang zh --trainpref /tmp2/ted2020/train --validpref /tmp2/ted2020/valid --testpref /tmp2/ted2020/test --destdir /tmp2/ted2020-bin --joined-dictionary --workers 2
     ```
 
-3. Execute `main.py` with option `--test` and `--load-ckpt <checkpoint>` to generate prediction.
+4. Execute `train.py` to train a model from stretch.
 
     ```bash
-    $ python main.py --test --load-ckpt <checkpoint>
+    $ python train.py
+    ```
+
+5. Average checkpoints
+
+   ```bash
+   $ python fairseq/scripts/average_checkpoints.py --inputs checkpoints/rnn --num-epoch-checkpoints 5 --output checkpoints/rnn/avg_last_5_checkpoint.pt
+   ```
+
+6. Execute `inference.py` with option `--load-ckpt <checkpoint>` to generate prediction.
+
+    ```bash
+    $ python inference.py --load-ckpt <checkpoint>
     ```

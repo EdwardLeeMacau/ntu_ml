@@ -121,11 +121,11 @@ def same_seeds(seed):
     torch.backends.cudnn.deterministic = True
 
 # TODO: Handle keyword 'kwarg'
-def flatten(param: Dict, prefix: str = ""):
+def flatten(param: Dict, prefix: str = "", delim: str = '_'):
     retval = {}
 
     for k, v in param.items():
-        p = k if prefix == '' else f'{prefix}.{k}'
+        p = k if prefix == '' else f'{prefix}{delim}{k}'
         retval.update(flatten(v, p)) if isinstance(v, dict) else retval.update({p: v})
 
     return retval

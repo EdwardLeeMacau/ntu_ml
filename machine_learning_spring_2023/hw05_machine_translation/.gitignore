@@ -1,0 +1,8 @@
+# 3rd-party dependency
+fairseq
+
+# Auto-generated
+checkpoints/
+prediction.txt
+wandb/
+.ipynb_checkpoints/

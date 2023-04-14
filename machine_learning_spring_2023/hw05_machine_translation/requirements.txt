@@ -1,0 +1,8 @@
+editdistance
+fairseq
+matplotlib
+sacrebleu
+sacremoses
+sentencepiece
+tqdm
+wandb

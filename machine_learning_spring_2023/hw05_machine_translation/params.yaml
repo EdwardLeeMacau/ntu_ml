@@ -1,23 +1,48 @@
 env:
-  dataset: ../../../dataset/voxceleb2
-  checkpoint: ../../../checkpoint/voxceleb2
+  dataset: ../../../dataset/ted2020
+  binarized: ../../../dataset/ted2020-bin
+  checkpoint: ../../../checkpoint/ted2020
   k-max-ckpt: 5
-epochs: 1024
+dataset:
+  train-ratio: 0.99
+subword:
+  model: unigram
+  size: 8000
+epochs: 45
 optimizer:
   name: AdamW
   kwargs:
-    lr: 1.0e-3
-    weight_decay: 0
+    lr: 0
+    betas:
+      - 0.9
+      - 0.98
+    eps: 1.0e-9
+    weight_decay: 1.0e-4
+clip_norm: 1.0
+decoding:
+  beam: 5                                 # beam: beam size for beam search
+  max_len_a: 1.2                          # a, b: generate sequences of maximum length ax + b,
+  max_len_b: 10                           #       where x is the source length
+  post_process: sentencepiece             # post_process: when decoding, post process sentence by
+                                          #               removing sentencepiece symbols and
+                                          #               jieba tokenization.
 batch-size: 128
-seed: 87
+seed: 33
 scheduler:
-  name: StepLR
+  name: Noam
   kwargs:
-    gamma: 0.1
-    step_size: 1024
-    step_unit: epoch
+    model_size: 256                       # Equals to 'encoder_embed_dim'
+    lr_factor: 2.0
+    lr_warmup: 4000
 early-stop: 1024
 model:
-  d_model: 80
-  dim_feedforward: 512
-  n_head: 4
+  dropout: 0.3
+  encoder:
+    embed_dim: 512
+    ffn_embed_dim: 2048
+    layers: 6
+  decoder:
+    embed_dim: 512
+    ffn_embed_dim: 1024
+    layers: 6
+  share_decoder_input_output_embed: true
