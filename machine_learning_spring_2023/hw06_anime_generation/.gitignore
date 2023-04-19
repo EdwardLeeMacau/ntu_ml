@@ -1,4 +1,6 @@
+# Auto generated files
 results/
-submission
+submission/
 submission.tgz
-runs
+runs/
+models/

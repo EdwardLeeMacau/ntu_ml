@@ -1,21 +1,48 @@
 from torch import nn
+import numpy as np
 import math
 import torch
+from typing import Callable
 from tqdm import tqdm
 from functools import partial
 from einops import rearrange, reduce, repeat
 from einops.layers.torch import Rearrange
 import torch.nn.functional as F
+import pysnooper
 from dataset import Dataset
 from torch.utils.data import DataLoader
 
+# Reference: https://huggingface.co/blog/annotated-diffusion#defining-the-forward-diffusion-process
+def cosine_beta_schedule(timesteps, s=0.008):
+    """ cosine schedule as proposed in https://arxiv.org/abs/2102.09672 """
+    steps = timesteps + 1
+    x = torch.linspace(0, timesteps, steps)
+    alphas_cumprod = torch.cos(((x / timesteps) + s) / (1 + s) * torch.pi * 0.5) ** 2
+    alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
+    betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
+
+    return torch.clip(betas, 0.0001, 0.9999)
 
 def linear_beta_schedule(timesteps):
     """ linear schedule, proposed in original ddpm paper """
     scale = 1000 / timesteps
     beta_start = scale * 0.0001
     beta_end = scale * 0.02
+
     return torch.linspace(beta_start, beta_end, timesteps, dtype = torch.float64)
+
+def quadratic_beta_schedule(timesteps):
+    beta_start = 0.0001
+    beta_end = 0.02
+
+    return torch.linspace(beta_start**0.5, beta_end**0.5, timesteps) ** 2
+
+def sigmoid_beta_schedule(timesteps):
+    beta_start = 0.0001
+    beta_end = 0.02
+    betas = torch.linspace(-6, 6, timesteps)
+
+    return torch.sigmoid(betas) * (beta_end - beta_start) + beta_start
 
 def extract(a, t, x_shape):
     b, *_ = t.shape
@@ -359,7 +386,7 @@ class GaussianDiffusion(nn.Module):
         *,
         image_size,
         timesteps = 1000,
-        beta_schedule = 'linear',
+        beta_schedule_fn: Callable = linear_beta_schedule,
         auto_normalize = True
     ):
         super().__init__()
@@ -367,16 +394,8 @@ class GaussianDiffusion(nn.Module):
         assert not model.random_or_learned_sinusoidal_cond
 
         self.model = model
-
         self.channels = self.model.channels
-
         self.image_size = image_size
-
-
-        if beta_schedule == 'linear':
-            beta_schedule_fn = linear_beta_schedule
-        else:
-            raise ValueError(f'unknown beta schedule {beta_schedule}')
 
         # calculate beta and other precalculated parameters
         betas = beta_schedule_fn(timesteps)
@@ -483,7 +502,7 @@ class GaussianDiffusion(nn.Module):
         return model_mean, posterior_variance, posterior_log_variance, x_start
 
     @torch.no_grad()
-    def p_sample(self, x, t: int):
+    def p_ddpm_sample(self, x, t: int):
         b, *_, device = *x.shape, x.device
         batched_times = torch.full((b,), t, device = x.device, dtype = torch.long)
         model_mean, _, model_log_variance, x_start = self.p_mean_variance(x = x, t = batched_times, clip_denoised = True)
@@ -492,7 +511,7 @@ class GaussianDiffusion(nn.Module):
         return pred_img, x_start
 
     @torch.no_grad()
-    def p_sample_loop(self, shape, return_all_timesteps = False):
+    def p_ddpm_sample_loop(self, shape, return_all_timesteps = False):
         batch, device = shape[0], self.betas.device
 
         img = torch.randn(shape, device = device)
@@ -500,11 +519,60 @@ class GaussianDiffusion(nn.Module):
 
         x_start = None
 
-        ###########################################
-        ## TODO: plot the sampling process ##
-        ###########################################
-        for t in tqdm(reversed(range(0, self.num_timesteps)), desc='sampling', total=self.num_timesteps, ncols=0, leave=False):
-            img, x_start = self.p_sample(img, t)
+        for t in tqdm(reversed(range(0, self.num_timesteps)), desc='DDPM sampling', total=self.num_timesteps, ncols=0, leave=False):
+            img, x_start = self.p_ddpm_sample(img, t)
+            imgs.append(img)
+
+        ret = img if not return_all_timesteps else torch.stack(imgs, dim = 1)
+
+        ret = self.unnormalize(ret)
+        return ret
+
+    # https://github.com/xiaohu2015/nngen/blob/main/models/diffusion_models/ddim_mnist.ipynb
+    @torch.no_grad()
+    def p_ddim_sample_loop(self, shape, return_all_timesteps = False, timesteps = 50, discr_method = 'uniform', eta = 0.0):
+        batch, device = shape[0], self.betas.device
+
+        img = torch.randn(shape, device = device)
+        imgs = [img]
+
+        if discr_method == 'uniform':
+            c = self.num_timesteps // timesteps
+            timestep_seq = np.asarray(list(range(0, self.num_timesteps, c)))
+        elif discr_method == 'quad':
+            timestep_seq = np.asarray(
+                (np.linspace(0, np.sqrt(self.num_timesteps * .8), timesteps)) ** 2
+            ).astype(int)
+        else:
+            raise NotImplementedError(f'There is no such discretization method called {discr_method}')
+
+        timestep_seq += 1
+        timestep_prev_seq = np.append(np.array([0]), timestep_seq[:-1])
+
+        clip_denoised = True
+        x_start = None
+
+        for i in tqdm(reversed(range(0, timesteps)), desc='DDIM sampling', total=timesteps, ncols=0, leave=False):
+            t = torch.full((batch, ), timestep_seq[i], device = device, dtype = torch.long)
+            prev_t = torch.full((batch, ), timestep_prev_seq[i], device = device, dtype = torch.long)
+
+            alpha_cumprod_t = extract(self.alphas_cumprod, t, img.shape)
+            alpha_cumprod_prev_t = extract(self.alphas_cumprod, prev_t, img.shape)
+
+            pred_noise = self.model(img, t)
+            pred_x_start = (img - torch.sqrt((1. - alpha_cumprod_t)) * pred_noise) / torch.sqrt(alpha_cumprod_t)
+
+            if clip_denoised:
+                pred_x_start = torch.clamp(pred_x_start, -1., 1.)
+
+            sigmas_t = eta * torch.sqrt(
+                (1 - alpha_cumprod_prev_t) / (1 - alpha_cumprod_t) * (1 - alpha_cumprod_t) / alpha_cumprod_prev_t
+            )
+
+            pred_dir_xt = torch.sqrt(1 - alpha_cumprod_prev_t - sigmas_t ** 2) * pred_noise
+            x_prev = torch.sqrt(alpha_cumprod_prev_t) * pred_x_start + pred_dir_xt + sigmas_t * torch.randn_like(img)
+
+            img = x_prev
             imgs.append(img)
 
         ret = img if not return_all_timesteps else torch.stack(imgs, dim = 1)
@@ -513,11 +581,10 @@ class GaussianDiffusion(nn.Module):
         return ret
 
     @torch.no_grad()
-    def sample(self, batch_size = 16, return_all_timesteps = False):
+    def sample(self, batch_size = 16, return_all_timesteps = False, sample_fn = None):
         image_size, channels = self.image_size, self.channels
-        sample_fn = self.p_sample_loop
+        sample_fn = self.p_ddpm_sample_loop if sample_fn is None else sample_fn
         return sample_fn((batch_size, channels, image_size, image_size), return_all_timesteps = return_all_timesteps)
-
 
     def q_sample(self, x_start, t, noise=None):
         noise = default(noise, lambda: torch.randn_like(x_start))
@@ -531,7 +598,6 @@ class GaussianDiffusion(nn.Module):
     def loss_fn(self):
         return F.mse_loss
 
-
     def p_losses(self, x_start, t, noise = None):
         b, c, h, w = x_start.shape
         noise = default(noise, lambda: torch.randn_like(x_start))
@@ -542,6 +608,7 @@ class GaussianDiffusion(nn.Module):
 
         # predict and take gradient step
 
+        # Model aims to predict the noise from the image
         model_out = self.model(x, t)
 
         loss = self.loss_fn(model_out, noise, reduction = 'none')
@@ -553,8 +620,12 @@ class GaussianDiffusion(nn.Module):
     def forward(self, img, *args, **kwargs):
         b, c, h, w, device, img_size, = *img.shape, img.device, self.image_size
         assert h == img_size and w == img_size, f'height and width of image must be {img_size}'
+
+        # uniform sampling of timesteps
         t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
 
+        # normalize image such that mean is 0
         img = self.normalize(img)
+
         return self.p_losses(img, t, *args, **kwargs)
 
