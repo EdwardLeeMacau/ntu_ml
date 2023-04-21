@@ -1,0 +1,13 @@
+# Python intermediate
+__pycache__
+
+# Generated model
+*.pt
+
+# Dataset
+data
+!data.tgz
+
+# Generated file
+fgsm
+ifgsm
