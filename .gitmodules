@@ -19,3 +19,6 @@
 [submodule "single_image_dehazing/AtJ_DH"]
 	path = single_image_dehazing/atj_dh
 	url = git@github.com:EdwardLeeMacau/AtJ_DH.git
+[submodule "ntucsie_adl"]
+	path = applied_deep_learning_fall_2022
+	url = git@github.com:EdwardLeeMacau/ntucsie_adl.git
