@@ -1,0 +1,12 @@
+# Python intermediate
+__pycache__
+
+# Generated model
+*.pt
+
+# Generated file
+*.csv
+*.png
+/metrics.json
+/runs
+.ipynb_checkpoints
