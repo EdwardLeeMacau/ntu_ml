@@ -1,0 +1,19 @@
+# Checkpoints
+*.pt
+checkpoints/
+
+# Preprocessed inputs
+cache/
+
+# Generated outputs
+train_val.json
+*.csv
+
+# Downloaded model parameters
+*.tar.gz
+
+# Python Intermediate
+__pycache__
+
+# Editor Intermediate
+*.swp
