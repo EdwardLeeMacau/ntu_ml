@@ -28,6 +28,11 @@ _optimizer = {
     'SGD': SGD,
 }
 
+def cycle(iterable):
+    while True:
+        for x in iterable:
+            yield x
+
 # TODO: Logger which adapts Google Colab, Kaggle, and server
 class Logger:
     pass
@@ -84,15 +89,15 @@ class ModelCheckpointPreserver:
             return os.path.join(f"{self.dirname}", f"model-{iteration:08d}.pt")
 
         # If metric is lower than all elements in queue (don't be kept)
-        if self.is_full() and metric < min(self.records.values()):
+        if self.is_full() and metric > max(self.records.values()):
             return False
 
         # Drop previous model from disk
         if self.is_full():
-            min_key, _ = argmin(self.records)
+            max_key, _ = argmax(self.records)
 
-            self.records.pop(min_key)
-            os.remove(fname(min_key))
+            self.records.pop(max_key)
+            os.remove(fname(max_key))
 
         # Store current model to disk
         self.records[iteration] = metric

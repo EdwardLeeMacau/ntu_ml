@@ -1,25 +1,20 @@
 env:
-  dataset: /tmp2/edwardlee/libriphone
-  checkpoint: /tmp2/edwardlee/libriphone-ckpt
-epochs: 250
+  dataset: /tmp2/edwardlee/dataset/anomaly
+  checkpoint: /tmp2/edwardlee/checkpoints/anomaly
+iterations: 80000
 optimizer:
-  name: RAdam
+  name: Adam
   kwargs:
-    lr: 3.0e-4
-    weight_decay: 1.0e-5
-batch-size:
-  train: 32
-seed: 3407
-ratio: 0.99
+    lr: 5.0e-4
+    weight_decay: 0
 scheduler:
   name: StepLR
   kwargs:
-    gamma: 0.1
-    step_size: 200
-    step_unit: epoch
+    step_size: 4000
+    gamma: 0.95
+batch-size:
+  train: 256
+  test: 256
+seed: 0
 model:
-  dropout: 0.50
-  n-frames: 15
-  bidirectional: true
-  hidden_dim: 256
-  hidden_layers: 10
+  type: cnn

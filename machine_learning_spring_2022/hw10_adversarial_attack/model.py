@@ -88,7 +88,6 @@ class EnsembleNet(nn.Module):
         for i, m in enumerate(self.models):
             logits[i] = m(x)
 
-        # Brain-fuck time: make ensemble weight learnable!?
         return logits.mean(dim=0)
 
 def fgsm(model: nn.Module, x, y, loss_fn, epsilon=8, **kwargs):
@@ -132,7 +131,7 @@ def ifgsm(model, x, y, loss_fn, epsilon=8, alpha=0.8, num_iter=20, **kwargs):
 
     return x_adv
 
-def mifgsm(model, x, y, loss_fn, epsilon=8, alpha=0.8, num_iter=20, decay=1.0, **kwargs):
+def mifgsm(model, x, y, loss_fn, epsilon=8, alpha=0.8, num_iter=40, decay=1.0, **kwargs):
     """ Multistep Iterated fast gradient sign method.
 
     The algorithm can be degenerated to I-FGSM and FGSM using the following hyper-parameters.

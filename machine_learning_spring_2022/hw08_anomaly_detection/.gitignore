@@ -10,3 +10,4 @@ __pycache__
 /metrics.json
 /runs
 .ipynb_checkpoints
+pca.pkl
