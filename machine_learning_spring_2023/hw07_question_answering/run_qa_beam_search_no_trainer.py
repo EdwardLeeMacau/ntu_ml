@@ -14,12 +14,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Fine-tuning a 🤗 Transformers model for question answering using 🤗 Accelerate.
+Fine-tuning XLNet for question answering with beam search using 🤗 Accelerate.
 """
 # You can also adapt this script on your own question answering task. Pointers for this are left as comments.
 
 import argparse
-import csv
 import json
 import logging
 import math
@@ -28,44 +27,40 @@ import random
 from pathlib import Path
 
 import datasets
+import evaluate
 import numpy as np
 import torch
-from datasets import load_dataset
-from torch.utils.data import DataLoader
-from tqdm.auto import tqdm
-
-import evaluate
-import transformers
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import set_seed
-from huggingface_hub import Repository
+from datasets import load_dataset
+from huggingface_hub import Repository, create_repo
+from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
+from utils_qa import postprocess_qa_predictions_with_beam_search
+
+import transformers
 from transformers import (
-    CONFIG_MAPPING,
-    MODEL_MAPPING,
-    AutoConfig,
-    AutoModelForQuestionAnswering,
-    AutoTokenizer,
+    AdamW,
     DataCollatorWithPadding,
     EvalPrediction,
     SchedulerType,
+    XLNetConfig,
+    XLNetForQuestionAnswering,
+    XLNetTokenizerFast,
     default_data_collator,
     get_scheduler,
 )
 from transformers.utils import check_min_version, get_full_repo_name, send_example_telemetry
 from transformers.utils.versions import require_version
-from utils_qa import postprocess_qa_predictions
 
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
-check_min_version("4.22.0")
+check_min_version("4.27.0")
 
 require_version("datasets>=1.8.0", "To fix: pip install -r examples/pytorch/question-answering/requirements.txt")
 
 logger = get_logger(__name__)
-# You should update this to your particular problem to have better documentation of `model_type`
-MODEL_CONFIG_CLASSES = list(MODEL_MAPPING.keys())
-MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
 
 
 def save_prefixed_metrics(results, output_dir, file_name: str = "all_results.json", metric_key_prefix: str = "eval"):
@@ -92,7 +87,7 @@ def save_prefixed_metrics(results, output_dir, file_name: str = "all_results.jso
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Fine tune a transformers model on a Question Answering task")
+    parser = argparse.ArgumentParser(description="Finetune a transformers model on a Question Answering task")
     parser.add_argument(
         "--dataset_name",
         type=str,
@@ -109,9 +104,9 @@ def parse_args():
         "--train_file", type=str, default=None, help="A csv or a json file containing the training data."
     )
     parser.add_argument(
-        "--preprocessing_num_workers", type=int, default=4, help="A csv or a json file containing the training data."
+        "--preprocessing_num_workers", type=int, default=1, help="A csv or a json file containing the training data."
     )
-    parser.add_argument("--do_predict", action="store_true", help="To do prediction on the question answering model")
+    parser.add_argument("--do_predict", action="store_true", help="Eval the question answering model")
     parser.add_argument(
         "--validation_file", type=str, default=None, help="A csv or a json file containing the validation data."
     )
@@ -121,7 +116,7 @@ def parse_args():
     parser.add_argument(
         "--max_seq_length",
         type=int,
-        default=512,
+        default=384,
         help=(
             "The maximum total input sequence length after tokenization. Sequences longer than this will be truncated,"
             " sequences shorter will be padded if `--pad_to_max_lengh` is passed."
@@ -136,24 +131,7 @@ def parse_args():
         "--model_name_or_path",
         type=str,
         help="Path to pretrained model or model identifier from huggingface.co/models.",
-        required=False,
-    )
-    parser.add_argument(
-        "--config_name",
-        type=str,
-        default=None,
-        help="Pretrained config name or path if not the same as model_name",
-    )
-    parser.add_argument(
-        "--tokenizer_name",
-        type=str,
-        default=None,
-        help="Pretrained tokenizer name or path if not the same as model_name",
-    )
-    parser.add_argument(
-        "--use_slow_tokenizer",
-        action="store_true",
-        help="If passed, will use a slow tokenizer (not backed by the 🤗 Tokenizers library).",
+        required=True,
     )
     parser.add_argument(
         "--per_device_train_batch_size",
@@ -254,20 +232,13 @@ def parse_args():
         ),
     )
     parser.add_argument(
-        "--overwrite_cache", type=bool, default=False, help="Overwrite the cached training and evaluation sets"
+        "--overwrite_cache", action="store_true", help="Overwrite the cached training and evaluation sets"
     )
     parser.add_argument(
         "--max_predict_samples",
         type=int,
         default=None,
         help="For debugging purposes or quicker training, truncate the number of prediction examples to this",
-    )
-    parser.add_argument(
-        "--model_type",
-        type=str,
-        default=None,
-        help="Model type to use if training from scratch.",
-        choices=MODEL_TYPES,
     )
     parser.add_argument("--push_to_hub", action="store_true", help="Whether or not to push the model to the Hub.")
     parser.add_argument(
@@ -289,7 +260,7 @@ def parse_args():
     parser.add_argument(
         "--with_tracking",
         action="store_true",
-        help="Whether to enable experiment trackers for logging.",
+        help="Whether to load in all available experiment trackers from the environment and use them for logging.",
     )
     parser.add_argument(
         "--report_to",
@@ -333,10 +304,10 @@ def main():
 
     # Sending telemetry. Tracking the example usage helps us better allocate resources to maintain them. The
     # information sent is the one passed as arguments along with your Python/PyTorch versions.
-    send_example_telemetry("run_qa_no_trainer", args)
+    send_example_telemetry("run_qa_beam_search_no_trainer", args)
 
     # Initialize the accelerator. We will let the accelerator handle device placement for us in this example.
-    # If we're using tracking, we also need to initialize it here and it will by default pick up all supported trackers
+    # If we're using tracking, we also need to initialize it here and it will pick up all supported trackers
     # in the environment
     accelerator_log_kwargs = {}
 
@@ -371,7 +342,8 @@ def main():
                 repo_name = get_full_repo_name(Path(args.output_dir).name, token=args.hub_token)
             else:
                 repo_name = args.hub_model_id
-            repo = Repository(args.output_dir, clone_from=repo_name)
+            create_repo(repo_name, exist_ok=True, token=args.hub_token)
+            repo = Repository(args.output_dir, clone_from=repo_name, token=args.hub_token)
 
             with open(os.path.join(args.output_dir, ".gitignore"), "w+") as gitignore:
                 if "step_*" not in gitignore:
@@ -412,37 +384,14 @@ def main():
     # In distributed training, the .from_pretrained methods guarantee that only one local process can concurrently
     # download model & vocab.
 
-    if args.config_name:
-        config = AutoConfig.from_pretrained(args.config_name)
-    elif args.model_name_or_path:
-        config = AutoConfig.from_pretrained(args.model_name_or_path)
-    else:
-        config = CONFIG_MAPPING[args.model_type]()
-        logger.warning("You are instantiating a new config instance from scratch.")
-
-    if args.tokenizer_name:
-        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name, use_fast=True)
-    elif args.model_name_or_path:
-        tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, use_fast=True)
-    else:
-        raise ValueError(
-            "You are instantiating a new tokenizer from scratch. This is not supported by this script."
-            "You can do it from another script, save it, and load it from here, using --tokenizer_name."
-        )
-
-    if args.model_name_or_path:
-        model = AutoModelForQuestionAnswering.from_pretrained(
-            args.model_name_or_path,
-            from_tf=bool(".ckpt" in args.model_name_or_path),
-            config=config,
-        )
-    else:
-        logger.info("Training new model from scratch")
-        model = AutoModelForQuestionAnswering.from_config(config)
+    config = XLNetConfig.from_pretrained(args.model_name_or_path)
+    tokenizer = XLNetTokenizerFast.from_pretrained(args.model_name_or_path)
+    model = XLNetForQuestionAnswering.from_pretrained(
+        args.model_name_or_path, from_tf=bool(".ckpt" in args.model_name_or_path), config=config
+    )
 
     # Preprocessing the datasets.
-    # Preprocessing is slightly different for training and evaluation.
-
+    # Preprocessing is slighlty different for training and evaluation.
     column_names = raw_datasets["train"].column_names
 
     question_column_name = "question" if "question" in column_names else column_names[0]
@@ -478,7 +427,9 @@ def main():
             stride=args.doc_stride,
             return_overflowing_tokens=True,
             return_offsets_mapping=True,
-            padding="max_length" if args.pad_to_max_length else False,
+            return_special_tokens_mask=True,
+            return_token_type_ids=True,
+            padding="max_length",
         )
 
         # Since one example might give us several features if it has a long context, we need a map from a feature to
@@ -487,18 +438,37 @@ def main():
         # The offset mappings will give us a map from token to character position in the original context. This will
         # help us compute the start_positions and end_positions.
         offset_mapping = tokenized_examples.pop("offset_mapping")
+        # The special tokens will help us build the p_mask (which indicates the tokens that can't be in answers).
+        special_tokens = tokenized_examples.pop("special_tokens_mask")
 
         # Let's label those examples!
         tokenized_examples["start_positions"] = []
         tokenized_examples["end_positions"] = []
+        tokenized_examples["is_impossible"] = []
+        tokenized_examples["cls_index"] = []
+        tokenized_examples["p_mask"] = []
 
         for i, offsets in enumerate(offset_mapping):
             # We will label impossible answers with the index of the CLS token.
             input_ids = tokenized_examples["input_ids"][i]
             cls_index = input_ids.index(tokenizer.cls_token_id)
+            tokenized_examples["cls_index"].append(cls_index)
 
             # Grab the sequence corresponding to that example (to know what is the context and what is the question).
-            sequence_ids = tokenized_examples.sequence_ids(i)
+            sequence_ids = tokenized_examples["token_type_ids"][i]
+            for k, s in enumerate(special_tokens[i]):
+                if s:
+                    sequence_ids[k] = 3
+            context_idx = 1 if pad_on_right else 0
+
+            # Build the p_mask: non special tokens and context gets 0.0, the others get 1.0.
+            # The cls token gets 1.0 too (for predictions of empty answers).
+            tokenized_examples["p_mask"].append(
+                [
+                    0.0 if (not special_tokens[i][k] and s == context_idx) or k == cls_index else 1.0
+                    for k, s in enumerate(sequence_ids)
+                ]
+            )
 
             # One example can give several spans, this is the index of the example containing this span of text.
             sample_index = sample_mapping[i]
@@ -507,6 +477,7 @@ def main():
             if len(answers["answer_start"]) == 0:
                 tokenized_examples["start_positions"].append(cls_index)
                 tokenized_examples["end_positions"].append(cls_index)
+                tokenized_examples["is_impossible"].append(1.0)
             else:
                 # Start/end character index of the answer in the text.
                 start_char = answers["answer_start"][0]
@@ -514,18 +485,18 @@ def main():
 
                 # Start token index of the current span in the text.
                 token_start_index = 0
-                while sequence_ids[token_start_index] != (1 if pad_on_right else 0):
+                while sequence_ids[token_start_index] != context_idx:
                     token_start_index += 1
 
                 # End token index of the current span in the text.
                 token_end_index = len(input_ids) - 1
-                while sequence_ids[token_end_index] != (1 if pad_on_right else 0):
+                while sequence_ids[token_end_index] != context_idx:
                     token_end_index -= 1
-
                 # Detect if the answer is out of the span (in which case this feature is labeled with the CLS index).
                 if not (offsets[token_start_index][0] <= start_char and offsets[token_end_index][1] >= end_char):
                     tokenized_examples["start_positions"].append(cls_index)
                     tokenized_examples["end_positions"].append(cls_index)
+                    tokenized_examples["is_impossible"].append(1.0)
                 else:
                     # Otherwise move the token_start_index and token_end_index to the two ends of the answer.
                     # Note: we could go after the last offset if the answer is the last word (edge case).
@@ -535,6 +506,7 @@ def main():
                     while offsets[token_end_index][1] >= end_char:
                         token_end_index -= 1
                     tokenized_examples["end_positions"].append(token_end_index + 1)
+                    tokenized_examples["is_impossible"].append(0.0)
 
         return tokenized_examples
 
@@ -544,7 +516,6 @@ def main():
     if args.max_train_samples is not None:
         # We will select sample from whole data if agument is specified
         train_dataset = train_dataset.select(range(args.max_train_samples))
-
     # Create train feature from dataset
     with accelerator.main_process_first():
         train_dataset = train_dataset.map(
@@ -555,9 +526,9 @@ def main():
             load_from_cache_file=not args.overwrite_cache,
             desc="Running tokenizer on train dataset",
         )
-        if args.max_train_samples is not None:
-            # Number of samples might increase during Feature Creation, We select only specified max samples
-            train_dataset = train_dataset.select(range(args.max_train_samples))
+    if args.max_train_samples is not None:
+        # Number of samples might increase during Feature Creation, We select only specified max samples
+        train_dataset = train_dataset.select(range(args.max_train_samples))
 
     # Validation preprocessing
     def prepare_validation_features(examples):
@@ -577,21 +548,45 @@ def main():
             stride=args.doc_stride,
             return_overflowing_tokens=True,
             return_offsets_mapping=True,
-            padding="max_length" if args.pad_to_max_length else False,
+            return_special_tokens_mask=True,
+            return_token_type_ids=True,
+            padding="max_length",
         )
 
         # Since one example might give us several features if it has a long context, we need a map from a feature to
         # its corresponding example. This key gives us just that.
         sample_mapping = tokenized_examples.pop("overflow_to_sample_mapping")
 
+        # The special tokens will help us build the p_mask (which indicates the tokens that can't be in answers).
+        special_tokens = tokenized_examples.pop("special_tokens_mask")
+
         # For evaluation, we will need to convert our predictions to substrings of the context, so we keep the
         # corresponding example_id and we will store the offset mappings.
         tokenized_examples["example_id"] = []
 
-        for i in range(len(tokenized_examples["input_ids"])):
+        # We still provide the index of the CLS token and the p_mask to the model, but not the is_impossible label.
+        tokenized_examples["cls_index"] = []
+        tokenized_examples["p_mask"] = []
+
+        for i, input_ids in enumerate(tokenized_examples["input_ids"]):
+            # Find the CLS token in the input ids.
+            cls_index = input_ids.index(tokenizer.cls_token_id)
+            tokenized_examples["cls_index"].append(cls_index)
+
             # Grab the sequence corresponding to that example (to know what is the context and what is the question).
-            sequence_ids = tokenized_examples.sequence_ids(i)
-            context_index = 1 if pad_on_right else 0
+            sequence_ids = tokenized_examples["token_type_ids"][i]
+            for k, s in enumerate(special_tokens[i]):
+                if s:
+                    sequence_ids[k] = 3
+            context_idx = 1 if pad_on_right else 0
+
+            # Build the p_mask: non special tokens and context gets 0.0, the others 1.0.
+            tokenized_examples["p_mask"].append(
+                [
+                    0.0 if (not special_tokens[i][k] and s == context_idx) or k == cls_index else 1.0
+                    for k, s in enumerate(sequence_ids)
+                ]
+            )
 
             # One example can give several spans, this is the index of the example containing this span of text.
             sample_index = sample_mapping[i]
@@ -600,7 +595,7 @@ def main():
             # Set to None the offset_mapping that are not part of the context so it's easy to determine if a token
             # position is part of the context or not.
             tokenized_examples["offset_mapping"][i] = [
-                (o if sequence_ids[k] == context_index else None)
+                (o if sequence_ids[k] == context_idx else None)
                 for k, o in enumerate(tokenized_examples["offset_mapping"][i])
             ]
 
@@ -649,8 +644,8 @@ def main():
                 predict_dataset = predict_dataset.select(range(args.max_predict_samples))
 
     # Log a few random samples from the training set:
-    # for index in random.sample(range(len(train_dataset)), 3):
-    #     logger.info(f"Sample {index} of the training set: {train_dataset[index]}.")
+    for index in random.sample(range(len(train_dataset)), 3):
+        logger.info(f"Sample {index} of the training set: {train_dataset[index]}.")
 
     # DataLoaders creation:
     if args.pad_to_max_length:
@@ -681,21 +676,23 @@ def main():
     # Post-processing:
     def post_processing_function(examples, features, predictions, stage="eval"):
         # Post-processing: we match the start logits and end logits to answers in the original context.
-        predictions = postprocess_qa_predictions(
+        predictions, scores_diff_json = postprocess_qa_predictions_with_beam_search(
             examples=examples,
             features=features,
             predictions=predictions,
             version_2_with_negative=args.version_2_with_negative,
             n_best_size=args.n_best_size,
             max_answer_length=args.max_answer_length,
-            null_score_diff_threshold=args.null_score_diff_threshold,
+            start_n_top=model.config.start_n_top,
+            end_n_top=model.config.end_n_top,
             output_dir=args.output_dir,
             prefix=stage,
         )
         # Format the result to the format the metric expects.
         if args.version_2_with_negative:
             formatted_predictions = [
-                {"id": k, "prediction_text": v, "no_answer_probability": 0.0} for k, v in predictions.items()
+                {"id": k, "prediction_text": v, "no_answer_probability": scores_diff_json[k]}
+                for k, v in predictions.items()
             ]
         else:
             formatted_predictions = [{"id": k, "prediction_text": v} for k, v in predictions.items()]
@@ -705,7 +702,6 @@ def main():
 
     metric = evaluate.load("squad_v2" if args.version_2_with_negative else "squad")
 
-    # Create and fill numpy array of size len_of_validation_data * max_length_of_output_tensor
     def create_and_fill_np_array(start_or_end_logits, dataset, max_len):
         """
         Create and fill numpy array of size len_of_validation_data * max_length_of_output_tensor
@@ -720,7 +716,7 @@ def main():
 
         step = 0
         # create a numpy array and fill it with -100.
-        logits_concat = np.full((len(dataset), max_len), -100, dtype=np.float64)
+        logits_concat = np.full((len(dataset), max_len), -100, dtype=np.float32)
         # Now since we have create an array now we will populate it with the outputs gathered using accelerator.gather_for_metrics
         for i, output_logit in enumerate(start_or_end_logits):  # populate columns
             # We have to fill it such that we have to take the whole tensor and replace it on the newly created array
@@ -728,7 +724,6 @@ def main():
 
             batch_size = output_logit.shape[0]
             cols = output_logit.shape[1]
-
             if step + batch_size < len(dataset):
                 logits_concat[step : step + batch_size, :cols] = output_logit
             else:
@@ -751,7 +746,7 @@ def main():
             "weight_decay": 0.0,
         },
     ]
-    optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=args.learning_rate)
+    optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate)
 
     # Scheduler and math around the number of training steps.
     overrode_max_train_steps = False
@@ -772,11 +767,6 @@ def main():
         model, optimizer, train_dataloader, eval_dataloader, lr_scheduler
     )
 
-    if args.do_predict:
-        predict_dataloader = accelerator.prepare(
-            predict_dataloader
-        )
-
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
     if overrode_max_train_steps:
@@ -789,25 +779,12 @@ def main():
     if checkpointing_steps is not None and checkpointing_steps.isdigit():
         checkpointing_steps = int(checkpointing_steps)
 
-    # We need to initialize the trackers we use, and also store our configuration.
-    # The trackers initializes automatically on the main process.
+    # We need to initialize the trackers we use, and also store our configuration
     if args.with_tracking:
         experiment_config = vars(args)
         # TensorBoard cannot log Enums, need the raw value
         experiment_config["lr_scheduler_type"] = experiment_config["lr_scheduler_type"].value
-        accelerator.init_trackers("qa_no_trainer", experiment_config)
-
-    if args.output_dir is not None:
-        accelerator.wait_for_everyone()
-        unwrapped_model = accelerator.unwrap_model(model)
-        unwrapped_model.save_pretrained(
-            args.output_dir, is_main_process=accelerator.is_main_process, save_function=accelerator.save
-        )
-
-        if accelerator.is_main_process:
-            tokenizer.save_pretrained(args.output_dir)
-            if args.push_to_hub:
-                repo.push_to_hub(commit_message="End of training", auto_lfs_prune=True)
+        accelerator.init_trackers("qa_beam_search_no_trainer", experiment_config)
 
     # Train!
     total_batch_size = args.per_device_train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
@@ -851,8 +828,7 @@ def main():
         model.train()
         if args.with_tracking:
             total_loss = 0
-
-        for step, batch in enumerate(train_dataloader, start=epoch*len(train_dataloader)):
+        for step, batch in enumerate(train_dataloader):
             # We need to skip steps until we reach the resumed step
             if args.resume_from_checkpoint and epoch == starting_epoch:
                 if resume_step is not None and step < resume_step:
@@ -862,19 +838,12 @@ def main():
             with accelerator.accumulate(model):
                 outputs = model(**batch)
                 loss = outputs.loss
-
-                # We keep track of the loss at each step
+                # We keep track of the loss at each epoch
                 if args.with_tracking:
-                    total_loss += loss.item()
-                    accelerator.log(
-                        values={
-                            "train_loss": loss.item(),
-                            "learning_rate": lr_scheduler.get_lr()[0]
-                        },
-                        step=step,
-                    )
+                    total_loss += loss.detach().float()
 
                 accelerator.backward(loss)
+
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
@@ -892,39 +861,60 @@ def main():
                     accelerator.save_state(output_dir)
 
                     # Evaluation during training
-                    logger.info("***** Running Evaluation *****")
-                    logger.info(f"  Num examples = {len(eval_dataset)}")
-                    logger.info(f"  Batch size = {args.per_device_eval_batch_size}")
-
-                    all_start_logits = []
-                    all_end_logits = []
+                    all_start_top_log_probs = []
+                    all_start_top_index = []
+                    all_end_top_log_probs = []
+                    all_end_top_index = []
+                    all_cls_logits = []
 
                     model.eval()
 
-                    for _, batch in enumerate(eval_dataloader):
+                    for step, batch in enumerate(eval_dataloader):
                         with torch.no_grad():
                             outputs = model(**batch)
-                            start_logits = outputs.start_logits
-                            end_logits = outputs.end_logits
+                            start_top_log_probs = outputs.start_top_log_probs
+                            start_top_index = outputs.start_top_index
+                            end_top_log_probs = outputs.end_top_log_probs
+                            end_top_index = outputs.end_top_index
+                            cls_logits = outputs.cls_logits
 
                             if not args.pad_to_max_length:  # necessary to pad predictions and labels for being gathered
-                                start_logits = accelerator.pad_across_processes(start_logits, dim=1, pad_index=-100)
-                                end_logits = accelerator.pad_across_processes(end_logits, dim=1, pad_index=-100)
+                                start_top_log_probs = accelerator.pad_across_processes(start_top_log_probs, dim=1, pad_index=-100)
+                                start_top_index = accelerator.pad_across_processes(start_top_index, dim=1, pad_index=-100)
+                                end_top_log_probs = accelerator.pad_across_processes(end_top_log_probs, dim=1, pad_index=-100)
+                                end_top_index = accelerator.pad_across_processes(end_top_index, dim=1, pad_index=-100)
+                                cls_logits = accelerator.pad_across_processes(cls_logits, dim=1, pad_index=-100)
 
-                            all_start_logits.append(accelerator.gather_for_metrics(start_logits).cpu().numpy())
-                            all_end_logits.append(accelerator.gather_for_metrics(end_logits).cpu().numpy())
+                            all_start_top_log_probs.append(accelerator.gather_for_metrics(start_top_log_probs).cpu().numpy())
+                            all_start_top_index.append(accelerator.gather_for_metrics(start_top_index).cpu().numpy())
+                            all_end_top_log_probs.append(accelerator.gather_for_metrics(end_top_log_probs).cpu().numpy())
+                            all_end_top_index.append(accelerator.gather_for_metrics(end_top_index).cpu().numpy())
+                            all_cls_logits.append(accelerator.gather_for_metrics(cls_logits).cpu().numpy())
 
-                    max_len = max([x.shape[1] for x in all_start_logits])  # Get the max_length of the tensor
+                    max_len = max([x.shape[1] for x in all_end_top_log_probs])  # Get the max_length of the tensor
 
-                    # concatenate the numpy array
-                    start_logits_concat = create_and_fill_np_array(all_start_logits, eval_dataset, max_len)
-                    end_logits_concat = create_and_fill_np_array(all_end_logits, eval_dataset, max_len)
+                    # concatenate all numpy arrays collected above
+                    start_top_log_probs_concat = create_and_fill_np_array(all_start_top_log_probs, eval_dataset, max_len)
+                    start_top_index_concat = create_and_fill_np_array(all_start_top_index, eval_dataset, max_len)
+                    end_top_log_probs_concat = create_and_fill_np_array(all_end_top_log_probs, eval_dataset, max_len)
+                    end_top_index_concat = create_and_fill_np_array(all_end_top_index, eval_dataset, max_len)
+                    cls_logits_concat = np.concatenate(all_cls_logits, axis=0)
 
                     # delete the list of numpy arrays
-                    del all_start_logits
-                    del all_end_logits
+                    del start_top_log_probs
+                    del start_top_index
+                    del end_top_log_probs
+                    del end_top_index
+                    del cls_logits
 
-                    outputs_numpy = (start_logits_concat, end_logits_concat)
+                    outputs_numpy = (
+                        start_top_log_probs_concat,
+                        start_top_index_concat,
+                        end_top_log_probs_concat,
+                        end_top_index_concat,
+                        cls_logits_concat,
+                    )
+
                     prediction = post_processing_function(eval_examples, eval_dataset, outputs_numpy)
                     eval_metric = metric.compute(predictions=prediction.predictions, references=prediction.label_ids)
                     logger.info(f"Evaluation metrics: {eval_metric}")
@@ -939,12 +929,6 @@ def main():
             if completed_steps >= args.max_train_steps:
                 break
 
-        if args.checkpointing_steps == "epoch":
-            output_dir = f"epoch_{epoch}"
-            if args.output_dir is not None:
-                output_dir = os.path.join(args.output_dir, output_dir)
-            accelerator.save_state(output_dir)
-
         if args.push_to_hub and epoch < args.num_train_epochs - 1:
             accelerator.wait_for_everyone()
             unwrapped_model = accelerator.unwrap_model(model)
@@ -957,105 +941,139 @@ def main():
                     commit_message=f"Training in progress epoch {epoch}", blocking=False, auto_lfs_prune=True
                 )
 
-    # Evaluation
-    logger.info("***** Running Evaluation *****")
-    logger.info(f"  Num examples = {len(eval_dataset)}")
-    logger.info(f"  Batch size = {args.per_device_eval_batch_size}")
-
-    all_start_logits = []
-    all_end_logits = []
+    # intialize all lists to collect the batches
+    all_start_top_log_probs = []
+    all_start_top_index = []
+    all_end_top_log_probs = []
+    all_end_top_index = []
+    all_cls_logits = []
 
     model.eval()
 
     for step, batch in enumerate(eval_dataloader):
         with torch.no_grad():
             outputs = model(**batch)
-            start_logits = outputs.start_logits
-            end_logits = outputs.end_logits
+            start_top_log_probs = outputs.start_top_log_probs
+            start_top_index = outputs.start_top_index
+            end_top_log_probs = outputs.end_top_log_probs
+            end_top_index = outputs.end_top_index
+            cls_logits = outputs.cls_logits
 
             if not args.pad_to_max_length:  # necessary to pad predictions and labels for being gathered
-                start_logits = accelerator.pad_across_processes(start_logits, dim=1, pad_index=-100)
-                end_logits = accelerator.pad_across_processes(end_logits, dim=1, pad_index=-100)
+                start_top_log_probs = accelerator.pad_across_processes(start_top_log_probs, dim=1, pad_index=-100)
+                start_top_index = accelerator.pad_across_processes(start_top_index, dim=1, pad_index=-100)
+                end_top_log_probs = accelerator.pad_across_processes(end_top_log_probs, dim=1, pad_index=-100)
+                end_top_index = accelerator.pad_across_processes(end_top_index, dim=1, pad_index=-100)
+                cls_logits = accelerator.pad_across_processes(cls_logits, dim=1, pad_index=-100)
 
-            all_start_logits.append(accelerator.gather_for_metrics(start_logits).cpu().numpy())
-            all_end_logits.append(accelerator.gather_for_metrics(end_logits).cpu().numpy())
+            all_start_top_log_probs.append(accelerator.gather_for_metrics(start_top_log_probs).cpu().numpy())
+            all_start_top_index.append(accelerator.gather_for_metrics(start_top_index).cpu().numpy())
+            all_end_top_log_probs.append(accelerator.gather_for_metrics(end_top_log_probs).cpu().numpy())
+            all_end_top_index.append(accelerator.gather_for_metrics(end_top_index).cpu().numpy())
+            all_cls_logits.append(accelerator.gather_for_metrics(cls_logits).cpu().numpy())
 
-    max_len = max([x.shape[1] for x in all_start_logits])  # Get the max_length of the tensor
+    max_len = max([x.shape[1] for x in all_end_top_log_probs])  # Get the max_length of the tensor
 
-    # concatenate the numpy array
-    start_logits_concat = create_and_fill_np_array(all_start_logits, eval_dataset, max_len)
-    end_logits_concat = create_and_fill_np_array(all_end_logits, eval_dataset, max_len)
+    # concatenate all numpy arrays collected above
+    start_top_log_probs_concat = create_and_fill_np_array(all_start_top_log_probs, eval_dataset, max_len)
+    start_top_index_concat = create_and_fill_np_array(all_start_top_index, eval_dataset, max_len)
+    end_top_log_probs_concat = create_and_fill_np_array(all_end_top_log_probs, eval_dataset, max_len)
+    end_top_index_concat = create_and_fill_np_array(all_end_top_index, eval_dataset, max_len)
+    cls_logits_concat = np.concatenate(all_cls_logits, axis=0)
 
     # delete the list of numpy arrays
-    del all_start_logits
-    del all_end_logits
+    del start_top_log_probs
+    del start_top_index
+    del end_top_log_probs
+    del end_top_index
+    del cls_logits
 
-    outputs_numpy = (start_logits_concat, end_logits_concat)
+    outputs_numpy = (
+        start_top_log_probs_concat,
+        start_top_index_concat,
+        end_top_log_probs_concat,
+        end_top_index_concat,
+        cls_logits_concat,
+    )
     prediction = post_processing_function(eval_examples, eval_dataset, outputs_numpy)
     eval_metric = metric.compute(predictions=prediction.predictions, references=prediction.label_ids)
     logger.info(f"Evaluation metrics: {eval_metric}")
 
-    # Prediction
     if args.do_predict:
-        logger.info("***** Running Prediction *****")
-        logger.info(f"  Num examples = {len(predict_dataset)}")
-        logger.info(f"  Batch size = {args.per_device_eval_batch_size}")
+        # intialize all lists to collect the batches
 
-        all_start_logits = []
-        all_end_logits = []
+        all_start_top_log_probs = []
+        all_start_top_index = []
+        all_end_top_log_probs = []
+        all_end_top_index = []
+        all_cls_logits = []
 
         model.eval()
 
         for step, batch in enumerate(predict_dataloader):
             with torch.no_grad():
                 outputs = model(**batch)
-                start_logits = outputs.start_logits
-                end_logits = outputs.end_logits
+                start_top_log_probs = outputs.start_top_log_probs
+                start_top_index = outputs.start_top_index
+                end_top_log_probs = outputs.end_top_log_probs
+                end_top_index = outputs.end_top_index
+                cls_logits = outputs.cls_logits
 
                 if not args.pad_to_max_length:  # necessary to pad predictions and labels for being gathered
-                    start_logits = accelerator.pad_across_processes(start_logits, dim=1, pad_index=-100)
-                    end_logits = accelerator.pad_across_processes(end_logits, dim=1, pad_index=-100)
+                    start_top_log_probs = accelerator.pad_across_processes(start_top_log_probs, dim=1, pad_index=-100)
+                    start_top_index = accelerator.pad_across_processes(start_top_index, dim=1, pad_index=-100)
+                    end_top_log_probs = accelerator.pad_across_processes(end_top_log_probs, dim=1, pad_index=-100)
+                    end_top_index = accelerator.pad_across_processes(end_top_index, dim=1, pad_index=-100)
+                    cls_logits = accelerator.pad_across_processes(cls_logits, dim=1, pad_index=-100)
 
-                all_start_logits.append(accelerator.gather_for_metrics(start_logits).cpu().numpy())
-                all_end_logits.append(accelerator.gather_for_metrics(end_logits).cpu().numpy())
+                all_start_top_log_probs.append(accelerator.gather_for_metrics(start_top_log_probs).cpu().numpy())
+                all_start_top_index.append(accelerator.gather_for_metrics(start_top_index).cpu().numpy())
+                all_end_top_log_probs.append(accelerator.gather_for_metrics(end_top_log_probs).cpu().numpy())
+                all_end_top_index.append(accelerator.gather_for_metrics(end_top_index).cpu().numpy())
+                all_cls_logits.append(accelerator.gather_for_metrics(cls_logits).cpu().numpy())
 
-        max_len = max([x.shape[1] for x in all_start_logits])  # Get the max_length of the tensor
-        # concatenate the numpy array
-        start_logits_concat = create_and_fill_np_array(all_start_logits, predict_dataset, max_len)
-        end_logits_concat = create_and_fill_np_array(all_end_logits, predict_dataset, max_len)
+        max_len = max([x.shape[1] for x in all_end_top_log_probs])  # Get the max_length of the tensor
+
+        # concatenate all numpy arrays collected above
+        start_top_log_probs_concat = create_and_fill_np_array(all_start_top_log_probs, predict_dataset, max_len)
+        start_top_index_concat = create_and_fill_np_array(all_start_top_index, predict_dataset, max_len)
+        end_top_log_probs_concat = create_and_fill_np_array(all_end_top_log_probs, predict_dataset, max_len)
+        end_top_index_concat = create_and_fill_np_array(all_end_top_index, predict_dataset, max_len)
+        cls_logits_concat = np.concatenate(all_cls_logits, axis=0)
 
         # delete the list of numpy arrays
-        del all_start_logits
-        del all_end_logits
+        del start_top_log_probs
+        del start_top_index
+        del end_top_log_probs
+        del end_top_index
+        del cls_logits
 
-        outputs_numpy = (start_logits_concat, end_logits_concat)
+        outputs_numpy = (
+            start_top_log_probs_concat,
+            start_top_index_concat,
+            end_top_log_probs_concat,
+            end_top_index_concat,
+            cls_logits_concat,
+        )
+
         prediction = post_processing_function(predict_examples, predict_dataset, outputs_numpy)
-        answers = prediction.predictions
-
-        # Write prediction file
-        with open(args.test_file, encoding='utf-8') as f:
-            questions = json.load(f)
-
-        with open('submission.csv', 'w') as f:
-            writer = csv.writer(f)
-            writer.writerow(['id', 'answer'])
-
-            for question, answer in zip(questions, answers):
-                assert(question['id'] == answer['id'])
-                writer.writerow([question['id'], answer['prediction_text']])
-
-        # predict_metric = metric.compute(predictions=prediction.predictions, references=prediction.label_ids)
-        # logger.info(f"Predict metrics: {predict_metric}")
+        predict_metric = metric.compute(predictions=prediction.predictions, references=prediction.label_ids)
+        logger.info(f"Predict metrics: {predict_metric}")
 
     if args.with_tracking:
         log = {
             "squad_v2" if args.version_2_with_negative else "squad": eval_metric,
+            "train_loss": total_loss,
             "epoch": epoch,
+            "step": completed_steps,
         }
+        if args.do_predict:
+            log["squad_v2_predict" if args.version_2_with_negative else "squad_predict"] = predict_metric
 
-    # if args.do_predict:
-    #     log["squad_v2_predict" if args.version_2_with_negative else "squad_predict"] = predict_metric
-    #     accelerator.log(log, step=completed_steps)
+        accelerator.log(log)
+
+    if args.checkpointing_steps == "epoch":
+        accelerator.save_state(f"epoch_{epoch}")
 
     if args.output_dir is not None:
         accelerator.wait_for_everyone()

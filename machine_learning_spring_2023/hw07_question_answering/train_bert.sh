@@ -13,18 +13,19 @@
 # limitations under the License.
 
 python run_qa_no_trainer.py \
-  --model_name_or_path hfl/chinese-roberta-wwm-ext \
+  --model_name_or_path ckiplab/albert-base-chinese \
   --train_file ./cache/hw7_train.json \
-  --validation_file ./cache/hw7_dev.json \
-  --output_dir ./checkpoints/hfl-chinese-roberta-wwm-ext \
+  --validation_file ./cache/hw7_dev_deduplicated.json \
+  --output_dir /tmp2/edwardlee/checkpoints/drcd/ckiplab-albert-base-chinese \
   --pad_to_max_length \
   --seed 0 \
   --with_tracking \
   --report_to tensorboard \
   --checkpointing_steps 200 \
-  --learning_rate 3e-5 \
-  --num_train_epochs 15 \
-  --num_warmup_steps 500 \
-  --gradient_accumulation_steps 8 \
-  --per_device_train_batch_size 32
+  --learning_rate 1e-4 \
+  --num_train_epochs 45 \
+  --num_warmup_steps 5000 \
+  --n_best_size 3 \
+  --gradient_accumulation_steps 1 \
+  --per_device_train_batch_size 64
 

@@ -27,13 +27,10 @@ def to_squad_format(context: List[str], questions: List[Dict]) -> List[Dict]:
         }
 
         q_formatted['context'] = context[q['paragraph_id']]
-
-        # Handling test set, the field 'answers' does not exist.
-        if q['answer_start'] is not None:
-            q_formatted['answers'] = {
-                'answer_start': [q['answer_start']],
-                'text': [q['answer_text']]
-            }
+        q_formatted['answers'] = {
+            'answer_start': [q.get('answer_start', None)],
+            'text': [q.get('answer_text', None)]
+        }
 
         results.append(q_formatted)
 

@@ -19,11 +19,11 @@ from transformers import (AutoConfig, AutoModelForMultipleChoice,
                           DataCollatorWithPadding, EvalPrediction,
                           PreTrainedTokenizerBase, default_data_collator)
 from transformers.utils import PaddingStrategy
-from utils_qa import postprocess_qa_predictions
+from utils_qa import postprocess_qa_predictions, postprocess_qa_predictions_with_beam_search
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Multiple choice and question answering script.")
+    parser = argparse.ArgumentParser(description="Question answering script, with BERT-based model.")
     parser.add_argument(
         "--question_file", type=str, required=True,
         help="A csv or a json file containing the prediction data."
@@ -43,7 +43,7 @@ def parse_args() -> argparse.Namespace:
         help="If passed, pad all samples to `max_length`. Otherwise, dynamic padding is used.",
     )
     parser.add_argument(
-        "--question_answering_model",
+        "--model_name_or_path",
         type=str,
         help="Path to question answering pre-trained model"
     )
@@ -89,7 +89,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--n_best_size",
         type=int,
-        default=20,
+        default=3,
         help="The total number of n-best predictions to generate when looking for an answer.",
     )
     parser.add_argument(
@@ -133,20 +133,20 @@ def question_answering(questions: List[Dict], args: argparse.Namespace) -> List[
 
     if args.config_name:
         config = AutoConfig.from_pretrained(args.config_name)
-    elif args.question_answering_model:
-        config = AutoConfig.from_pretrained(args.question_answering_model)
+    elif args.model_name_or_path:
+        config = AutoConfig.from_pretrained(args.model_name_or_path)
     else:
         raise ValueError
 
     if args.tokenizer_name:
         tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name)
-    elif args.question_answering_model:
-        tokenizer = AutoTokenizer.from_pretrained(args.question_answering_model)
+    elif args.model_name_or_path:
+        tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
     else:
         raise ValueError
 
     model = AutoModelForQuestionAnswering.from_pretrained(
-        args.question_answering_model,
+        args.model_name_or_path,
         from_tf=False,
         config=config
     )
@@ -317,154 +317,6 @@ def question_answering(questions: List[Dict], args: argparse.Namespace) -> List[
 
     return prediction
 
-# Returns model loss
-def question_answering_loss(context: List[str], questions: List[Dict], args: argparse.Namespace) -> List[str]:
-    accelerator = Accelerator()
-
-    # Prepare dataset
-    # When using your own dataset or a difference dataset from swag, you will probably need to change this.
-    raw_datasets = Dataset.from_dict(
-        pd.DataFrame(to_squad_format(context, questions)).to_dict(orient='list')
-    )
-
-    if args.config_name:
-        config = AutoConfig.from_pretrained(args.config_name)
-    elif args.question_answering_model:
-        config = AutoConfig.from_pretrained(args.question_answering_model)
-    else:
-        raise ValueError
-
-    if args.tokenizer_name:
-        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name)
-    elif args.question_answering_model:
-        tokenizer = AutoTokenizer.from_pretrained(args.question_answering_model)
-    else:
-        raise ValueError
-
-    model = AutoModelForQuestionAnswering.from_pretrained(
-        args.question_answering_model,
-        from_tf=False,
-        config=config
-    )
-
-    column_names = raw_datasets.column_names
-    question_column_name = "question" if "question" in column_names else column_names[0]
-    context_column_name = "context" if "context" in column_names else column_names[1]
-    answer_column_name = "answers" if "answers" in column_names else column_names[2]
-
-    pad_on_right = tokenizer.padding_side == "right"
-    max_seq_length = min(args.max_length, tokenizer.model_max_length)
-
-    # Training preprocessing
-    def prepare_train_features(examples):
-        # Some of the questions have lots of whitespace on the left, which is not useful and will make the
-        # truncation of the context fail (the tokenized question will take a lots of space). So we remove that
-        # left whitespace
-        examples[question_column_name] = [q.lstrip() for q in examples[question_column_name]]
-
-        # Tokenize our examples with truncation and maybe padding, but keep the overflows using a stride. This results
-        # in one example possible giving several features when a context is long, each of those features having a
-        # context that overlaps a bit the context of the previous feature.
-        tokenized_examples = tokenizer(
-            examples[question_column_name if pad_on_right else context_column_name],
-            examples[context_column_name if pad_on_right else question_column_name],
-            truncation="only_second" if pad_on_right else "only_first",
-            max_length=max_seq_length,
-            stride=args.doc_stride,
-            return_overflowing_tokens=True,
-            return_offsets_mapping=True,
-            padding="max_length" if args.pad_to_max_length else False,
-        )
-
-        # Since one example might give us several features if it has a long context, we need a map from a feature to
-        # its corresponding example. This key gives us just that.
-        sample_mapping = tokenized_examples.pop("overflow_to_sample_mapping")
-        # The offset mappings will give us a map from token to character position in the original context. This will
-        # help us compute the start_positions and end_positions.
-        offset_mapping = tokenized_examples.pop("offset_mapping")
-
-        # Let's label those examples!
-        tokenized_examples["start_positions"] = []
-        tokenized_examples["end_positions"] = []
-
-        for i, offsets in enumerate(offset_mapping):
-            # We will label impossible answers with the index of the CLS token.
-            input_ids = tokenized_examples["input_ids"][i]
-            cls_index = input_ids.index(tokenizer.cls_token_id)
-
-            # Grab the sequence corresponding to that example (to know what is the context and what is the question).
-            sequence_ids = tokenized_examples.sequence_ids(i)
-
-            # One example can give several spans, this is the index of the example containing this span of text.
-            sample_index = sample_mapping[i]
-            answers = examples[answer_column_name][sample_index]
-            # If no answers are given, set the cls_index as answer.
-            if len(answers["answer_start"]) == 0:
-                tokenized_examples["start_positions"].append(cls_index)
-                tokenized_examples["end_positions"].append(cls_index)
-            else:
-                # Start/end character index of the answer in the text.
-                start_char = answers["answer_start"][0]
-                end_char = start_char + len(answers["text"][0])
-
-                # Start token index of the current span in the text.
-                token_start_index = 0
-                while sequence_ids[token_start_index] != (1 if pad_on_right else 0):
-                    token_start_index += 1
-
-                # End token index of the current span in the text.
-                token_end_index = len(input_ids) - 1
-                while sequence_ids[token_end_index] != (1 if pad_on_right else 0):
-                    token_end_index -= 1
-
-                # Detect if the answer is out of the span (in which case this feature is labeled with the CLS index).
-                if not (offsets[token_start_index][0] <= start_char and offsets[token_end_index][1] >= end_char):
-                    tokenized_examples["start_positions"].append(cls_index)
-                    tokenized_examples["end_positions"].append(cls_index)
-                else:
-                    # Otherwise move the token_start_index and token_end_index to the two ends of the answer.
-                    # Note: we could go after the last offset if the answer is the last word (edge case).
-                    while token_start_index < len(offsets) and offsets[token_start_index][0] <= start_char:
-                        token_start_index += 1
-                    tokenized_examples["start_positions"].append(token_start_index - 1)
-                    while offsets[token_end_index][1] >= end_char:
-                        token_end_index -= 1
-                    tokenized_examples["end_positions"].append(token_end_index + 1)
-
-        return tokenized_examples
-
-    with accelerator.main_process_first():
-        dataset = raw_datasets.map(
-            prepare_train_features,
-            batched=True,
-            remove_columns=raw_datasets.column_names
-        )
-
-    # DataLoaders creation:
-    if args.pad_to_max_length:
-        # If padding was already done ot max length, we use the default data collator that will just convert everything
-        # to tensors.
-        data_collator = default_data_collator
-    else:
-        # Otherwise, `DataCollatorWithPadding` will apply dynamic padding for us (by padding to the maximum length of
-        # the samples passed). When using mixed precision, we add `pad_to_multiple_of=8` to pad all tensors to multiple
-        # of 8s, which will enable the use of Tensor Cores on NVIDIA hardware with compute capability >= 7.5 (Volta).
-        data_collator = DataCollatorWithPadding(tokenizer, pad_to_multiple_of=(8 if accelerator.use_fp16 else None))
-
-    dataloader = DataLoader(
-        dataset, collate_fn=data_collator, batch_size=args.per_device_eval_batch_size
-    )
-
-    model, dataloader = accelerator.prepare(model, dataloader)
-    model.eval()
-
-    total_loss = 0
-    with torch.no_grad():
-        for _, batch in enumerate(tqdm(dataloader)):
-            outputs = model(**batch)
-            total_loss += outputs.loss.item()
-
-    return total_loss
 
 def main():
     args = parse_args()
