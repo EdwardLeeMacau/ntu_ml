@@ -19,7 +19,7 @@ from transformers import (AutoConfig, AutoModelForMultipleChoice,
                           DataCollatorWithPadding, EvalPrediction,
                           PreTrainedTokenizerBase, default_data_collator)
 from transformers.utils import PaddingStrategy
-from utils_qa import postprocess_qa_predictions, postprocess_qa_predictions_with_beam_search
+from utils_qa import postprocess_qa_predictions
 
 
 def parse_args() -> argparse.Namespace:

@@ -13,19 +13,21 @@
 # limitations under the License.
 
 python run_qa_no_trainer.py \
-  --model_name_or_path ckiplab/albert-base-chinese \
+  --model_name_or_path hfl/chinese-pert-large-mrc \
   --train_file ./cache/hw7_train.json \
   --validation_file ./cache/hw7_dev_deduplicated.json \
-  --output_dir /tmp2/edwardlee/checkpoints/drcd/ckiplab-albert-base-chinese \
+  --output_dir /tmp2/edwardlee/checkpoints/drcd/hfl-chinese-pert-large-mrc \
   --pad_to_max_length \
   --seed 0 \
   --with_tracking \
   --report_to tensorboard \
   --checkpointing_steps 200 \
-  --learning_rate 1e-4 \
-  --num_train_epochs 45 \
-  --num_warmup_steps 5000 \
+  --learning_rate 3e-5 \
+  --doc_stride 128 \
+  --num_train_epochs 1 \
+  --lr_scheduler_type linear \
+  --num_warmup_steps 1000 \
   --n_best_size 3 \
   --gradient_accumulation_steps 1 \
-  --per_device_train_batch_size 64
+  --per_device_train_batch_size 16
 

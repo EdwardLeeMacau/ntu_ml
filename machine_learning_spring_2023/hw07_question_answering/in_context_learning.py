@@ -7,14 +7,16 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 
 # Fix random seed for reproducibility
 def same_seeds(seed):
-	torch.manual_seed(seed)
-	if torch.cuda.is_available():
-			torch.cuda.manual_seed(seed)
-			torch.cuda.manual_seed_all(seed)
-	np.random.seed(seed)
-	random.seed(seed)
-	torch.backends.cudnn.benchmark = False
-	torch.backends.cudnn.deterministic = True
+    torch.manual_seed(seed)
+
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
 
 # To clean model output. If you try different prompts, you may have to fix
 # this function on your own
@@ -24,10 +26,11 @@ def clean_text(text):
     text = text.split(" ")[0]
     return text
 
-root_dir = "../../../dataset/drcd"
-
 @torch.no_grad()
 def main():
+    torch.set_default_tensor_type(torch.cuda.FloatTensor)
+    root_dir = "/tmp2/edwardlee/dataset/drcd"
+
     same_seeds(2)
 
     # You can try model with different size
@@ -46,7 +49,7 @@ def main():
     # Give model K examples to make it achieve better accuracy
     # Note: (1) When K >= 4, CUDA_OUT_OFF_MEMORY may occur.
     #       (2) The maximum input length of XGLM is 2048
-    K = 2
+    K = 4
 
     question_ids = [qa["id"] for qa in test["questions"]]
 
@@ -54,7 +57,8 @@ def main():
         print("ID,Ground-Truth,Prediction", file = f)
         for idx, qa in enumerate(test["questions"]):
             # You can try different prompts
-            prompt = "請從最後一篇的文章中找出最後一個問題的答案\n"
+            prompt = "請從最後一篇的文章中找出最後一個問題的答案，將答案覆述一次\n"
+            # prompt = ""
             exist_question_indexs = [question_ids.index(qa["id"])]
 
             # K-shot learning: give the model K examples with answers
