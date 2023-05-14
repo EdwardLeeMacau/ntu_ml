@@ -1,19 +1,23 @@
-import torch
-import torch.nn as nn
 import argparse
 import os
 import shutil
-import numpy as np
-from PIL import Image
-from torchvision.transforms import transforms
-from torch.utils.data import DataLoader
-import matplotlib.pyplot as plt
+from typing import Callable, List, Union
+
+from tqdm import tqdm
 import imgaug.augmenters as iaa
-from typing import Callable, Union, List
-from dataset import AdvDataset
-from pytorchcv.model_provider import get_model
-from model import fgsm, ifgsm, mifgsm, EnsembleNet
+import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
+import torch
+import torch.nn as nn
+from model import EnsembleNet, fgsm, ifgsm, mifgsm
+from PIL import Image
+from pytorchcv.model_provider import get_model
+from torch.utils.data import DataLoader
+from torchvision.transforms import transforms
+from utils import same_seeds
+
+from dataset import AdvDataset
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 loss_fn = nn.CrossEntropyLoss()
@@ -37,21 +41,29 @@ batch_size = 8
 
 # Hyperparameters for attacker
 alpha = 0.8 / 255 / std
-method = 'ifgsm'
+method = 'mifgsm'
 
 # Check supported pre-trained models as proxy network
 #
 # Reference:
 # https://pypi.org/project/pytorchcv/
+#
+# Consider the models listed in the following link:
+# https://ithelp.ithome.com.tw/m/articles/10292724
 model_names = [
     'nin_cifar10',
     'resnet20_cifar10',
-    'preresnet20_cifar10'
+    'preresnet20_cifar10',
 ]
 
+# Consider adding defense techniques for evaluation
 eval_model_names = model_names.copy()
 eval_model_names.extend([
-    'resnet110_cifar10'
+    'resnet110_cifar10',
+    # 'resnext20_16x4d_cifar10', # Not supported by pytorchcv.
+    'densenet40_k12_cifar10',
+    'xdensenet40_2_k24_bc_cifar10',
+    'shakeshakeresnet20_2x16d_cifar10',
 ])
 
 root = './data' # directory for storing benign images
@@ -62,11 +74,14 @@ transform = transforms.Compose([
 ])
 
 @torch.no_grad()
-def inference(model: nn.Module, loader: DataLoader, loss_fn):
+def inference(model: nn.Module, loader: DataLoader, loss_fn: Callable, preprocess: Callable = None):
     acc, _loss = 0.0, 0.0
 
     for x, y in loader:
         x, y = x.to(device), y.to(device)
+
+        if preprocess:
+            x = preprocess(x)
 
         pred = model(x)
         loss = loss_fn(pred, y)
@@ -76,22 +91,20 @@ def inference(model: nn.Module, loader: DataLoader, loss_fn):
 
     return acc / len(loader.dataset), _loss / len(loader.dataset)
 
-def generate_adversarial_instances(model, loader, attack: Callable, loss_fn):
+def generate_adversarial_instances(model, loader, attacker: Callable, loss_fn):
     """
-    perform untargeted adversarial attack and generate adversarial examples
+    Perform untargeted adversarial attack and generate adversarial examples
     """
 
-    adv_names = []
-    acc, loss = 0.0, 0.0
-    for i, (x, y) in enumerate(loader):
+    for i, (x, y) in tqdm(enumerate(loader), ncols=0, desc='Generating adversarial examples'):
         x, y = x.to(device), y.to(device)
-        x_adv = attack(model, x, y, loss_fn, epsilon=epsilon, alpha=alpha, num_iter=10)
+        x_adv = attacker(model, x, y, loss_fn, epsilon=epsilon, alpha=alpha, num_iter=10)
 
-        pred = model(x_adv)
-        loss = loss_fn(pred, y)
+        # pred = model(x_adv)
+        # loss = loss_fn(pred, y)
 
-        acc += (pred.argmax(dim=1) == y).sum().item()
-        loss += loss.item() * x.shape[0]
+        # acc += (pred.argmax(dim=1) == y).sum().item()
+        # loss += loss.item() * x.shape[0]
 
         # store adversarial examples
         adv_ex = ((x_adv) * std + mean).clamp(0, 1) # to 0-1 scale
@@ -100,7 +113,7 @@ def generate_adversarial_instances(model, loader, attack: Callable, loss_fn):
         adv_ex = adv_ex.transpose((0, 2, 3, 1)) # transpose (bs, C, H, W) back to (bs, H, W, C)
         adv_examples = adv_ex if i == 0 else np.r_[adv_examples, adv_ex]
 
-    return adv_examples, acc / len(loader.dataset), loss / len(loader.dataset)
+    return adv_examples
 
 # create directory which stores adversarial examples
 def create_dir(data_dir, adv_dir, x_adv, fnames: List[str]):
@@ -220,8 +233,15 @@ def main():
 
     args = parser.parse_args()
 
-    eval_models = { n: create_model_instance(n, ensemble=False) for n in eval_model_names }
-    target_model = create_model_instance(model_names, ensemble=True)
+    same_seeds(0)
+
+    models = { n: create_model_instance(n, ensemble=False) for n in eval_model_names }
+    proxy = create_model_instance(model_names, ensemble=True)
+
+    # Guess what defense method the target model is applied.
+    defense = transforms.Compose([
+        transforms.GaussianBlur(3, sigma=0.5),
+    ])
 
     if args.attack:
         # Prepare to be attacked instances
@@ -233,8 +253,8 @@ def main():
 
         # Generate adversarial examples given a model as guidance
         print(f"Guidance: {model_names}")
-        x_adv, acc, loss = generate_adversarial_instances(
-            target_model, benign_dl, attacker, loss_fn
+        x_adv = generate_adversarial_instances(
+            proxy, benign_dl, attacker, loss_fn
         )
         create_dir(root, method, x_adv, benign_dl.dataset.__getname__())
 
@@ -243,24 +263,34 @@ def main():
         adv_dl = DataLoader(dataset, batch_size=batch_size, shuffle=False)
 
         metrics = {}
-        for k, m in eval_models.items():
-            benign_acc, benign_loss = inference(m, benign_dl, loss_fn)
-            adv_acc, adv_loss = inference(m, adv_dl, loss_fn)
+        for k, m in tqdm(models.items(), ncols=0, desc='Evaluating'):
+            metric = {}
 
+            # Inference with different setting to compare the attacking performance
+            benign_acc, _ = inference(m, benign_dl, loss_fn, preprocess=None)
+            metric['benign_acc_no_defense'] = benign_acc
+
+            benign_acc, _ = inference(m, benign_dl, loss_fn, preprocess=defense)
+            metric['benign_acc_with_defense'] = benign_acc
+
+            adv_acc, _ = inference(m, adv_dl, loss_fn)
+            metric['adv_acc_no_defense'] = adv_acc
+
+            adv_acc, _ = inference(m, adv_dl, loss_fn, preprocess=defense)
+            metric['adv_acc_with_defense'] = adv_acc
+
+            # mark with * if the model is used as proxy network
             name = ('*' if k in model_names else '') + k
-            metrics[name] = {
-                'benign_acc': benign_acc, 'adv_acc': adv_acc,
-                'benign_loss': benign_loss, 'adv_loss': adv_loss
-            }
+            metrics[name] = metric
 
         metrics = pd.DataFrame(metrics).T
         print(metrics)
 
     if args.visualize:
-        visualize(target_model)
+        visualize(proxy)
 
     if args.defense:
-        passive_defense(target_model)
+        passive_defense(proxy)
 
 if __name__ == '__main__':
     main()
