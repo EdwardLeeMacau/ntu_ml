@@ -1,0 +1,10 @@
+# Model weight fetch from torch hub
+**/yolov7.pt
+
+# Auto-generated
+.ipynb_checkpoints
+
+# Products
+prediction
+r11922001_hw3.zip
+r11922001_report.pdf
