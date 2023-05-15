@@ -1,0 +1,10 @@
+# Dataset
+**/*.zip
+food
+hw9_bert
+
+# Model Parameters
+checkpoint.pth
+
+# Font for generating figures
+taipei_sans_tc_beta.ttf
