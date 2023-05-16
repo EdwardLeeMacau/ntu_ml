@@ -50,10 +50,21 @@ method = 'mifgsm'
 #
 # Consider the models listed in the following link:
 # https://ithelp.ithome.com.tw/m/articles/10292724
+# https://github.com/yujunkuo/ML2022-Homework/blob/main/hw8/hw8_strong.ipynb
 model_names = [
     'nin_cifar10',
     'resnet20_cifar10',
     'preresnet20_cifar10',
+    'resnet56_cifar10',
+    'preresnet56_cifar10',
+    'seresnet20_cifar10',
+    'seresnet56_cifar10',
+    'sepreresnet20_cifar10',
+    'sepreresnet56_cifar10',
+    'diaresnet20_cifar10',
+    'diaresnet56_cifar10',
+    'diapreresnet20_cifar10',
+    'diapreresnet56_cifar10'
 ]
 
 # Consider adding defense techniques for evaluation
@@ -98,7 +109,7 @@ def generate_adversarial_instances(model, loader, attacker: Callable, loss_fn):
 
     for i, (x, y) in tqdm(enumerate(loader), ncols=0, desc='Generating adversarial examples'):
         x, y = x.to(device), y.to(device)
-        x_adv = attacker(model, x, y, loss_fn, epsilon=epsilon, alpha=alpha, num_iter=10)
+        x_adv = attacker(model, x, y, loss_fn, epsilon=epsilon, alpha=alpha, num_iter=40)
 
         # pred = model(x_adv)
         # loss = loss_fn(pred, y)
