@@ -17,4 +17,4 @@ batch-size:
   test: 256
 seed: 0
 model:
-  type: cnn
+  type: fcn

@@ -72,13 +72,9 @@ class FCNAutoEncoder(nn.Module):
     def __init__(self):
         super(FCNAutoEncoder, self).__init__()
         self.encoder = nn.Sequential(
-            nn.Linear(32 * 64 * 3, 1024),
+            nn.Linear(64 * 64 * 3, 512),
             nn.LeakyReLU(0.1),
-            nn.Linear(1024, 512),
-            nn.LeakyReLU(0.1),
-            nn.Linear(512, 256),
-            nn.LeakyReLU(0.1),
-            nn.Linear(256, 128),
+            nn.Linear(512, 128),
             nn.LeakyReLU(0.1),
             nn.Linear(128, 64),
         )
@@ -86,13 +82,9 @@ class FCNAutoEncoder(nn.Module):
         self.decoder = nn.Sequential(
             nn.Linear(64, 128),
             nn.LeakyReLU(0.1),
-            nn.Linear(128, 256),
+            nn.Linear(128, 512),
             nn.LeakyReLU(0.1),
-            nn.Linear(256, 512),
-            nn.LeakyReLU(0.1),
-            nn.Linear(512, 1024),
-            nn.LeakyReLU(0.1),
-            nn.Linear(1024, 32 * 64 * 3),
+            nn.Linear(512, 64 * 64 * 3),
             nn.Tanh()
         )
 

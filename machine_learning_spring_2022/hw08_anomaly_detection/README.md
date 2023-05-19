@@ -13,7 +13,7 @@
     # at /tmp2/anomaly/<timestamp>/model_<iteration>.pt
     env:
       dataset: /tmp2/anomaly
-      checkpoint: /tmp2/timestamp
+      checkpoint: /tmp2/anomaly/<timestamp>/model_<iteration>.pt
     ...
     ```
 

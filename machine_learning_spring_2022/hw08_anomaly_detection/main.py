@@ -13,7 +13,6 @@ from model import VAELoss, create_model
 from torch import nn
 from torch.utils.data import DataLoader, SequentialSampler
 from torch.utils.tensorboard import SummaryWriter
-from torchvision.transforms.functional import rgb_to_grayscale
 from torchvision.utils import make_grid, save_image
 from tqdm import tqdm, trange
 from utils import cycle, same_seeds
@@ -28,6 +27,9 @@ with open('params.yaml') as f:
 # fix random seed for reproducibility
 same_seeds(hparams['seed'])
 
+# utility functions
+def crop(*args):
+    return (x[:, :, 8:40, :] for x in args)
 
 def train():
     # create checkpoint directory
@@ -53,20 +55,10 @@ def train():
     writer = SummaryWriter()
 
     # utility functions
-    def preprocess(x):
-        return x[:, 8:40, :, :]
-
     def prepare_dataset(fname: str) -> DataLoader:
         dataset = np.load(fname, allow_pickle=True)
-        dataset = preprocess(dataset)
         dataset = torch.from_numpy(dataset)
         return CustomTensorDataset(dataset, transform=transform)
-
-    # TODO: consider denoising autoencoder
-    # specific transforms, only apply to input
-    # additional_transform = transforms.Compose([
-    #     GaussianNoise(0, 0.1),
-    # ])
 
     # build train dataloader
     dataset = prepare_dataset(os.path.join(root_dir, 'trainingset.npy'))
@@ -78,7 +70,6 @@ def train():
     test_img = next(
         iter(DataLoader(test_set, batch_size=batch_size, shuffle=False))
     ).float().to(device)
-    test_img_cpu = test_img.clone().cpu()
     reconstruction_error = nn.MSELoss(reduction='none')
 
     # utility functions
@@ -88,18 +79,21 @@ def train():
 
         # forwarding to reconstruct images
         out = model(test_img)
+        img = test_img                   # comment this line to boost performance
+        # out, img = crop(out, test_img) # uncomment this line to boost performance
 
         # use l2-norm as anomaly score, then sort images by score
-        loss = reconstruction_error(out, test_img).sum([1, 2, 3])
+        loss = reconstruction_error(out, img).sum([1, 2, 3])
         _, indices = torch.sort(loss, descending=True)
 
         # save image and write to tensorboard
-        out, indices = out.cpu(), indices.cpu()
+        out, img, indices = out.cpu(), img.cpu(), indices.cpu()
 
-        grid = torch.zeros(size=(batch_size, 2, 3, 32, 64))
+        # replace H to 32 to boost performance
+        grid = torch.zeros(size=(batch_size, 2, 3, 64, 64))
         grid[:, 0] = out[indices]
-        grid[:, 1] = test_img_cpu[indices]
-        grid = grid.view(-1, 3, 32, 64)
+        grid[:, 1] = img[indices]
+        grid = grid.view(-1, 3, 64, 64)
 
         grid = make_grid(grid, nrow=32, padding=2, pad_value=0, normalize=True, range=(-1, 1))
         writer.add_image('reconstruction', grid, i)
@@ -133,7 +127,9 @@ def train():
         # forwarding
         out = model(img)
 
-        # use multiple loss functions as guidance
+        # crop images, only penalize the center part of generated images
+        # leads some parameters waste at the output layer
+        # out, img = crop(out, test_img) # uncomment this line to boost performance
         loss = criteria(out, img)
 
         # backward propagation
@@ -174,13 +170,8 @@ def inference(checkpoint: str):
     model_type = hparams['model']['type']
     batch_size = hparams['batch-size']['test']
 
-    # utility functions
-    def preprocess(x):
-        return x[:, 8:40, :, :]
-
     def prepare_dataset(fname: str) -> DataLoader:
         dataset = np.load(fname, allow_pickle=True)
-        dataset = preprocess(dataset)
         dataset = torch.from_numpy(dataset)
         return CustomTensorDataset(dataset)
 
@@ -204,66 +195,108 @@ def inference(checkpoint: str):
 
     anomality = list()
     for img in tqdm(dataloader, ncols=0):
-        # ===================loading=====================
+        # prepare data, try some ensemble method.
         img = img.float()
         img = img.to(device)
 
-        # ===================forward=====================
-        # TODO: Consider multi-sampling for VAE
+        # forwarding
         out = model(img)
-
+        # out, img = crop(out, test_img) # uncomment this line to boost performance
         loss = criteria(out, img).sum([1, 2, 3])
+
+        # img = F.hflip(img)
+        # out = model(img)
+        # loss += criteria(out, img).sum([1, 2, 3])
+
         anomality.append(loss)
 
     anomality = torch.cat(anomality, axis=0)
     anomality = torch.sqrt(anomality).view(-1).cpu().numpy()
-    probability = np.zeros_like(anomality)
 
-    vec = np.stack((anomality, probability), axis=1)
-    df = pd.DataFrame(vec, columns=['score', 'probability'])
+    df = pd.DataFrame(anomality, columns=['score'])
 
     # write out to file, only score is required
     df['score'].to_csv(out_file, index_label = 'ID')
 
-    # plot score-prob correlation
-    plt.figure(figsize=(12.8, 7.2))
+def analyze(df: pd.DataFrame):
+    """ Analyze the anomaly score and visualize the result """
+    root_dir = hparams['env']['dataset']
 
-    plt.scatter(df['score'], df['probability'])
-    plt.xlabel('score')
-    plt.ylabel('probability')
-    plt.savefig('score-prob.png')
+    # plot histogram
+    plt.hist(df['score'], bins=100)
+    plt.savefig('histogram.png')
 
-    plt.clf()
+    # get top-k anomaly images, uncropped
+    dataset = np.load(os.path.join(root_dir, 'testingset.npy'), allow_pickle=True)
+    dataset = torch.from_numpy(dataset)
+    dataset = CustomTensorDataset(dataset, transform=transforms.Resize(32))
 
-    # get top-k anomaly images
-    k = 256
+    k = 1024
     df = df.sort_values(by=['score'], ascending=False)
+
     top_k = df[:k].index.values.tolist()
-
     img = torch.stack([dataset[i] for i in top_k])
-    img = img.float()
-    img = img.to(device)
+    grid = make_grid(img, nrow=64, padding=2, pad_value=0, normalize=True, value_range=(-1, 1))
+    save_image(grid, 'anomaly.png')
 
-    out = model(img)
-    residual = torch.abs(out - img) / 2
+    # get top-k normal images
+    top_k = df[-k:].index.values.tolist()
+    img = torch.stack([dataset[i] for i in top_k])
+    grid = make_grid(img, nrow=64, padding=2, pad_value=0, normalize=True, value_range=(-1, 1))
+    save_image(grid, 'normal.png')
 
-    img = img.detach().cpu()
-    out = out.detach().cpu()
-    residual = residual.detach().cpu()
-    residual = rgb_to_grayscale(residual)
+def demo(checkpoint: str):
+    # load hyperparameters
+    root_dir = hparams['env']['dataset']
+    model_type = hparams['model']['type']
+    if model_type != 'fcn':
+        raise ValueError('Demo only support FCN model, recv: {model_type}')
 
-    grid = make_grid(residual, nrow=32, padding=2, pad_value=0)
-    save_image(grid, 'residual.png')
+    # initialize model architecture and load model parameter
+    model, _ = create_model(model_type)
+    state_dict = torch.load(checkpoint)
+    model.load_state_dict(state_dict['model'])
+    model.to(device)
+    model.eval()
 
-    # de-normalize output image
-    grid = make_grid(out, nrow=32, padding=2, pad_value=0, normalize=True, value_range=(-1, 1))
-    save_image(grid, 'reconstruct.png')
+    def prepare_img(fname: str):
+        dataset = np.load(fname, allow_pickle=True)
+        dataset = torch.from_numpy(dataset)
+        dataset = CustomTensorDataset(dataset)
+        img = dataset[0].unsqueeze(0).float()
+        return img
+
+    # load single image from training set
+    img = prepare_img(os.path.join(root_dir, 'trainingset.npy'))
+    img = img.reshape(1, -1).to(device)
+
+    # retrieve latent vector, make 2 variant, reconstruct these latent vector
+    latent = torch.zeros(3, 64, device=device)
+    latent[:] = model.encoder(img)
+
+    # the first variant: negate z[32]
+    latent[1, 32] *= -1
+
+    # the second variant: negate z[63]
+    latent[2, -1] *= -1
+
+    # reconstruct the image and de-normalize
+    img = img.repeat(4, 1, 1, 1).reshape(4, 3, 64, 64)
+    img[1:4] = model.decoder(latent).reshape(-1, 3, 64, 64)
+    img = (img + 1) / 2
+
+    # store the image
+    img = make_grid(img, nrow=4, padding=2, pad_value=0, normalize=True, value_range=(0, 1))
+    save_image(img, f'demo.png')
+
+    return
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
 
     parser.add_argument('--train', action="store_true")
     parser.add_argument('--inference', action='store_true')
+    parser.add_argument('--demo', action='store_true')
     parser.add_argument('--load-ckpt', type=str)
 
     args = parser.parse_args()
@@ -273,3 +306,7 @@ if __name__ == '__main__':
 
     if args.inference:
         inference(args.load_ckpt)
+        # analyze(pd.read_csv('prediction.csv'))
+
+    if args.demo:
+        demo(args.load_ckpt)
