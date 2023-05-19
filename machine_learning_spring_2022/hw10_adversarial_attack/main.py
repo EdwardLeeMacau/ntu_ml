@@ -64,7 +64,7 @@ model_names = [
     'diaresnet20_cifar10',
     'diaresnet56_cifar10',
     'diapreresnet20_cifar10',
-    'diapreresnet56_cifar10'
+    'diapreresnet56_cifar10',
 ]
 
 # Consider adding defense techniques for evaluation
@@ -127,7 +127,7 @@ def generate_adversarial_instances(model, loader, attacker: Callable, loss_fn):
     return adv_examples
 
 # create directory which stores adversarial examples
-def create_dir(data_dir, adv_dir, x_adv, fnames: List[str]):
+def create_dir(data_dir: str, adv_dir: str, x_adv, fnames: List[str]):
     if not os.path.exists(adv_dir):
         _ = shutil.copytree(data_dir, adv_dir)
 
@@ -182,58 +182,79 @@ def visualize(model: nn.Module):
     plt.tight_layout()
     plt.show()
 
-    """## Report Question
-    * Make sure you follow below setup: the source model is "resnet110_cifar10", applying the vanilla fgsm attack on `dog2.png`. You can find the perturbed image in `fgsm/dog2.png`.
+
+@torch.no_grad()
+def passive_defense():
+    """
+    Apply JPEG compression on adversarial image as defense.
+
+    model: nn.Module
+        target classifier to be protected
+
+    im: Image
+        image which is adverarially crafted
+
+    Reference: https://imgaug.readthedocs.io/en/latest/source/api_augmenters_arithmetic.html#imgaug.augmenters.arithmetic.JpegCompression
     """
 
-    # original image
+    """## Report Question
+    * Make sure you follow below setup: the source model is "resnet110_cifar10",
+    applying the vanilla fgsm attack on `dog2.png`. You can find the perturbed image
+    in `fgsm/dog2.png`.
+    """
+
+    # create model instance
+    model = create_model_instance('resnet110_cifar10').to(device)
+    model.eval()
+
+    # select instance name
     path = f'dog/dog2.png'
+
+    # original image
     im = Image.open(f'./data/{path}')
     logit = model(transform(im).unsqueeze(0).to(device))[0]
     predict = logit.argmax(-1).item()
     prob = logit.softmax(-1)[predict].item()
+
     plt.title(f'benign: dog2.png\n{classes[predict]}: {prob:.2%}')
     plt.axis('off')
     plt.imshow(np.array(im))
     plt.tight_layout()
-    plt.show()
+    plt.savefig('benign.png')
+    plt.clf()
 
     # adversarial image
     adv_im = Image.open(f'./fgsm/{path}')
     logit = model(transform(adv_im).unsqueeze(0).to(device))[0]
     predict = logit.argmax(-1).item()
     prob = logit.softmax(-1)[predict].item()
+
     plt.title(f'adversarial: dog2.png\n{classes[predict]}: {prob:.2%}')
     plt.axis('off')
     plt.imshow(np.array(adv_im))
     plt.tight_layout()
-    plt.show()
+    plt.savefig('adversarial.png')
+    plt.clf()
 
-def passive_defense(model: nn.Module, adv_im: Image):
-    """## Passive Defense - JPEG compression
-    JPEG compression by imgaug package, compression rate set to 70
-
-    Reference: https://imgaug.readthedocs.io/en/latest/source/api_augmenters_arithmetic.html#imgaug.augmenters.arithmetic.JpegCompression
-    """
-
-    # pre-process image
+    # JPEG compress image
+    # convert PIL.Image to numpy array
     x = transforms.ToTensor()(adv_im) * 255
     x = x.permute(1, 2, 0).numpy()
     x = x.astype(np.uint8)
+    x = iaa.JpegCompression(compression=70)(image=x)
 
-    # TODO: use "imgaug" package to perform JPEG compression (compression rate = 70)
-    x = x
-
+    # convert back to torch tensor, and feed to model for prediction
     logit = model(transform(x).unsqueeze(0).to(device))[0]
     pred = logit.argmax(-1).item()
     prob = logit.softmax(-1)[pred].item()
 
     plt.title(f'JPEG adversarial: dog2.png\n{classes[pred]}: {prob:.2%}')
     plt.axis('off')
-
     plt.imshow(x)
     plt.tight_layout()
-    plt.show()
+    # plt.show()
+    plt.savefig('jpeg.png')
+    plt.clf()
 
 
 def main():
@@ -301,7 +322,7 @@ def main():
         visualize(proxy)
 
     if args.defense:
-        passive_defense(proxy)
+        passive_defense()
 
 if __name__ == '__main__':
     main()
