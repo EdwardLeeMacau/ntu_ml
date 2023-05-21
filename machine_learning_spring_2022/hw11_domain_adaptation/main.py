@@ -1,186 +1,449 @@
+import argparse
 import os
 
 import cv2
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import pysnooper
+from datetime import datetime
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import torch.optim as optim
 import torchvision.transforms as transforms
-from model import DomainClassifier, FeatureExtractor, LabelPredictor
-from torch.autograd import Function
+import yaml
+from model import (ConditionalEntropy, DomainClassifier, FeatureExtractor,
+                   Model, Reconstructor, VirtualAdversarialLoss,
+                   source_transform, target_transform)
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from torchvision.datasets import ImageFolder
-from tqdm import tqdm
+from tqdm import tqdm, trange
+from utils import create_optimizer, create_scheduler, cycle, same_seeds
 
-"""# Data Process
+# load hyperparameters from yaml
+with open("params.yaml", "r") as f:
+    hparams = yaml.load(f, Loader=yaml.FullLoader)
+
+# Determine unique experiment ID
+timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+
+# fix random seed for reproducibility
+same_seeds(hparams["seed"])
+root_dir = hparams['env']['dataset']
+ckpt_dir = os.path.join(hparams['env']['checkpoint'], timestamp)
+
+def adaptive_lambda(curr: int, total: int, k: float = 10):
+    """ adaptive lambda function, return lambda in range [0, 1] given x """
+    x = curr / total
+
+    # sigmoid function with shifting and scaling
+    lambda_ = (2 / (1 + np.exp(-k*x))) - 1
+    return lambda_
+
+class ModelTrainer:
+    """ Class wrapped domain transfer algorithm. """
+    def __init__(self, config: dict, dataset: dict) -> None:
+        super().__init__()
+
+        # hyper-parameters
+        self.config = config
+        self.epochs = config["iterations"]['train']
+        self.batch_size = config["batch-size"]
+
+        # model instance initialization
+        self.model = Model()
+        self.reconstructor = None
+        self.domain_classifier = DomainClassifier()
+
+        # store dataset to self
+        self.dataset = dataset
+
+    def pretrain(self) -> FeatureExtractor:
+        # check cuda availability
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        # create model for reconstruction
+        reconstructor = Reconstructor()
+        extractor = self.model.feature_extractor
+
+        # create optimizer and scheduler
+        params = list(reconstructor.parameters()) + list(extractor.parameters())
+        optimizer = create_optimizer(params, **self.config["optimizer"])
+        scheduler = create_scheduler(optimizer, **self.config["scheduler"])
+
+        # move model to device
+        reconstructor.to(device)
+        extractor.to(device)
+
+        # create writer
+        writer = SummaryWriter()
+
+        # create dataloader from dataset, use target dataset as unsupervised dataset here
+        dataloader = DataLoader(
+            self.dataset["target"], batch_size=self.batch_size, pin_memory=True, num_workers=4,
+            shuffle=True, drop_last=True
+        )
+
+        # compute number of iterations for each epoch
+        num_iter = self.config['iterations']['pretrain']
+
+        # create loss function
+        criterion = nn.MSELoss()
+
+        # create training loop
+        dataloader = cycle(dataloader)
+        pbar = trange(num_iter, ncols=0, desc='Pretraining')
+        for i in pbar:
+            # prepare data
+            (x, _) = next(dataloader)
+
+            # move data to device
+            x = x.to(device)
+
+            # forward
+            z = extractor(x)
+            x_hat = reconstructor(z)
+
+            # compute loss
+            loss = criterion(x_hat, x)
+
+            # backward
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            scheduler.step()
+
+            # log to tensorboard
+            metrics = { "loss": loss.item(), }
+            writer.add_scalars("pretrain", metrics, i)
+
+            # log to progress bar
+            postfix = { "loss": f'{loss.item():.4f}', }
+            pbar.set_postfix(postfix)
+
+        # move model to cpu, and deprecate the reconstructor.
+        reconstructor.cpu()
+        extractor.cpu()
+
+        # save model
+        torch.save(reconstructor.state_dict(), 'reconstructor.pth')
+        torch.save(extractor.state_dict(), 'extractor.pth')
+
+        # store reconstructor to self
+        self.reconstructor = reconstructor
+
+        return extractor
+
+    def domain_adversarial_training(self) -> Model:
+        # add a pretrain section
+        # self.model.feature_extractor = self.pretrain()
+
+        # load pretrain model
+        # self.model.feature_extractor.load_state_dict(torch.load('extractor.pth'))
+
+        # check cuda availability
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        # create optimizer and scheduler
+        params = list(self.model.parameters()) + list(self.domain_classifier.parameters())
+        optimizer = create_optimizer(params, **self.config["optimizer"])
+        scheduler = create_scheduler(optimizer, **self.config["scheduler"])
+
+        # create writer
+        writer = SummaryWriter()
+
+        # move model to device
+        self.model.to(device)
+        self.domain_classifier.to(device)
+
+        # hyper-parameters
+        lamda = self.config["lambda"]
+
+        # create dataloader from dataset
+        src_dl = DataLoader(
+            self.dataset["source"], batch_size=self.batch_size, pin_memory=True, num_workers=8,
+            shuffle=True, drop_last=True
+        )
+
+        tgt_dl = DataLoader(
+            self.dataset["target"], batch_size=self.batch_size, pin_memory=True, num_workers=8,
+            shuffle=True, drop_last=True
+        )
+
+        dataloader = zip(src_dl, tgt_dl)
+
+        # compute number of iterations for each epoch
+        num_iter = min((len(x) for x in (src_dl, tgt_dl))) * self.epochs
+
+        # create loss function
+        class_criterion = nn.CrossEntropyLoss()
+        domain_criterion = nn.BCEWithLogitsLoss()
+
+        # create training loop
+        pbar = trange(num_iter, ncols=0, desc='Training')
+        for i in pbar:
+            # prepare data
+            try:
+                (src_x, src_y), (tgt_x, _) = next(dataloader)
+            except StopIteration:
+                dataloader = zip(src_dl, tgt_dl)
+                (src_x, src_y), (tgt_x, _) = next(dataloader)
+
+            # move data to device
+            src_x = src_x.to(device)
+            src_y = src_y.to(device)
+            tgt_x = tgt_x.to(device)
+
+            # domain: 1 => source, 0 => target
+            x = torch.cat([src_x, tgt_x], dim=0)
+            domain_label = torch.zeros([self.batch_size * 2, 1]).to(device)
+            domain_label[:self.batch_size] = 1
+
+            # feature extraction
+            z = self.model.feature_extractor(x)
+
+            # domain classification, and image label prediction
+            # note that the lamda is applied in forward function of domain classifier.
+            domain_logits = self.domain_classifier(z, lamda)
+            class_logits = self.model.label_predictor(z[:self.batch_size])
+
+            # compute prediction loss and domain classification loss
+            loss_F = class_criterion(class_logits, src_y)
+            loss_D = domain_criterion(domain_logits, domain_label)
+
+            # notes the model applied gradient reversal layer.
+            # the optimize should tune the discriminator to minimize the loss_D, and tune
+            # the feature extractor to maximize the loss_D.
+            loss = loss_F + loss_D
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            scheduler.step()
+
+            # compute accuracy (in source domain)
+            source_acc = torch.sum(torch.argmax(class_logits, dim=1) == src_y).item()
+            source_acc /= self.batch_size
+
+            # log to tensorboard
+            metrics = { "loss_F": loss_F.item(), "loss_D": loss_D.item(), "acc": source_acc, }
+            writer.add_scalars("train", metrics, i)
+
+            # log to progress bar
+            postfix = {
+                "loss_F": f'{loss_F.item():.4f}',
+                "loss_D": f'{loss_D.item():.4f}',
+                "acc": f'{source_acc:.2%}',
+            }
+            pbar.set_postfix(postfix)
+
+            # store checkpoint
+
+        return self.model
+
+    def virtual_adversarial_domain_adaptation(self) -> Model:
+        # pretrain on target domain.
+        # self.model.feature_extractor = self.pretrain()
+
+        # check cuda availability
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        # create optimizer and scheduler
+        params = list(self.model.parameters()) + list(self.domain_classifier.parameters())
+        optimizer = create_optimizer(params, **self.config["optimizer"])
+        scheduler = create_scheduler(optimizer, **self.config["scheduler"])
+
+        # create writer
+        writer = SummaryWriter()
+
+        # move model to device
+        self.model.to(device)
+        self.domain_classifier.to(device)
+
+        # hyper-parameters
+        # lamda_D = self.config["lambda"]
+        lamda_C = 0 # self.config["lambda"]
+        lamda_V = 0 # self.config["lambda"]
+
+        # create dataloader from dataset
+        src_dl = DataLoader(
+            self.dataset["source"], batch_size=self.batch_size, pin_memory=True, num_workers=8,
+            shuffle=True, drop_last=True
+        )
+
+        tgt_dl = DataLoader(
+            self.dataset["target"], batch_size=self.batch_size, pin_memory=True, num_workers=8,
+            shuffle=True, drop_last=True
+        )
+
+        dataloader = zip(src_dl, tgt_dl)
+
+        # compute number of iterations for each epoch
+        num_iter = min((len(x) for x in (src_dl, tgt_dl))) * self.epochs
+
+        # create loss function
+        class_criterion = nn.CrossEntropyLoss()
+        domain_criterion = nn.BCEWithLogitsLoss()
+        conditional_criterion = ConditionalEntropy()
+        virtual_adversarial_criterion = VirtualAdversarialLoss(
+            model=self.model, radius=1
+        )
+
+        # create training loop
+        pbar = trange(num_iter, ncols=0, desc='Training')
+        for i in pbar:
+            # prepare data
+            try:
+                (src_x, src_y), (tgt_x, _) = next(dataloader)
+            except StopIteration:
+                dataloader = zip(src_dl, tgt_dl)
+                (src_x, src_y), (tgt_x, _) = next(dataloader)
+
+            # utility variable
+            # n: batch size for source domain
+            n = self.batch_size
+
+            # determine weight of domain adversarial loss
+            lamda_D = adaptive_lambda(i, num_iter)
+
+            # move data to device
+            src_x = src_x.to(device)
+            src_y = src_y.to(device)
+            tgt_x = tgt_x.to(device)
+
+            # domain: 1 => source, 0 => target
+            x = torch.cat([src_x, tgt_x], dim=0)
+            domain_label = torch.zeros([self.batch_size * 2, 1]).to(device)
+            domain_label[:self.batch_size] = 1
+
+            # feature extraction
+            z = self.model.feature_extractor(x)
+
+            # domain classification, and image label prediction
+            # note that the lamda is applied in forward function of domain classifier.
+            domain_logits = self.domain_classifier(z, lamda_D)
+            class_logits = self.model.label_predictor(z)
+
+            # compute prediction loss and domain classification loss
+            # notes the model applied gradient reversal layer.
+            # the optimize should tune the discriminator to minimize the loss_D, and tune
+            # the feature extractor to maximize the loss_D.
+            loss_F = class_criterion(class_logits[:n], src_y)
+            loss_D = domain_criterion(domain_logits, domain_label)
+
+            # compute conditional entropy loss and virtual adversarial loss
+            loss_C = 0 # conditional_criterion(class_logits[n:])
+            loss_V = 0 # virtual_adversarial_criterion(x, class_logits)
+
+            loss = loss_F + loss_D + lamda_C * loss_C + lamda_V * loss_V
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            scheduler.step()
+
+            # compute accuracy (in source domain)
+            source_acc = torch.sum(torch.argmax(class_logits[:n], dim=1) == src_y).item()
+            source_acc /= self.batch_size
+
+            # log to tensorboard
+            metrics = {
+                "loss_F": loss_F.item(), "loss_D": loss_D.item(),
+                # "loss_C": loss_C.item(), "loss_V": loss_V.item(),
+                "acc": source_acc,
+            }
+            writer.add_scalars("train", metrics, i)
+            writer.add_scalars("hparams", { 'lambda_D': lamda_D }, i)
+
+            # log to progress bar
+            postfix = {
+                "loss_F": f'{loss_F.item():.4f}',
+                "loss_D": f'{loss_D.item():.4f}',
+                # "loss_C": f'{loss_C.item():.4f}',
+                # "loss_V": f'{loss_V.item():.4f}',
+                "acc": f'{source_acc:.2%}',
+            }
+            pbar.set_postfix(postfix)
+
+            # store checkpoint
+
+        return self.model
+
+    def fit(self) -> Model:
+        return self.virtual_adversarial_domain_adaptation()
 
 
-The data is suitable for `torchvision.ImageFolder`. You can create a dataset with `torchvision.ImageFolder`. Details for image augmentation please refer to the comments in the following codes.
-"""
+def train():
+    # Imbalance case
+    # Labeled data: 5000 images
+    # Unlabeled data: 100k images
+    source_dataset = ImageFolder(
+        os.path.join(root_dir, 'train_data'), transform=source_transform
+    )
+    target_dataset = ImageFolder(
+        os.path.join(root_dir, 'test_data'), transform=target_transform
+    )
 
-source_transform = transforms.Compose([
-    # Turn RGB to grayscale. (Because Canny do not support RGB images.)
-    transforms.Grayscale(),
-    # cv2 do not support skimage.Image, so we transform it to np.array,
-    # and then adopt cv2.Canny algorithm.
-    transforms.Lambda(lambda x: cv2.Canny(np.array(x), 170, 300)),
-    # Transform np.array back to the skimage.Image.
-    transforms.ToPILImage(),
-    # 50% Horizontal Flip. (For Augmentation)
-    transforms.RandomHorizontalFlip(),
-    # Rotate +- 15 degrees. (For Augmentation), and filled with zero
-    # if there's empty pixel after rotation.
-    transforms.RandomRotation(15, fill=(0,)),
-    # Transform to tensor for model inputs.
-    transforms.ToTensor(),
-])
-target_transform = transforms.Compose([
-    # Turn RGB to grayscale.
-    transforms.Grayscale(),
-    # Resize: size of source data is 32x32, thus we need to
-    #  enlarge the size of target data from 28x28 to 32x32。
-    transforms.Resize((32, 32)),
-    # 50% Horizontal Flip. (For Augmentation)
-    transforms.RandomHorizontalFlip(),
-    # Rotate +- 15 degrees. (For Augmentation), and filled with zero
-    # if there's empty pixel after rotation.
-    transforms.RandomRotation(15, fill=(0,)),
-    # Transform to tensor for model inputs.
-    transforms.ToTensor(),
-])
+    model = ModelTrainer(
+        hparams, {'source': source_dataset, 'target': target_dataset }
+    ).fit()
 
+    os.makedirs(ckpt_dir, exist_ok=True)
+    torch.save(model.state_dict(), os.path.join(ckpt_dir, 'model.pth'))
 
-root_dir = "/tmp2/edwardlee/dataset/real_or_drawing/"
-source_dataset = ImageFolder(
-    os.path.join(root_dir, 'train_data'), transform=source_transform
-)
-target_dataset = ImageFolder(
-    os.path.join(root_dir, 'test_data'), transform=target_transform
-)
+    return model
 
-source_dataloader = DataLoader(source_dataset, batch_size=32, shuffle=True)
-target_dataloader = DataLoader(target_dataset, batch_size=32, shuffle=True)
-test_dataloader = DataLoader(target_dataset, batch_size=128, shuffle=False)
+def inference(model: nn.Module):
+    # Inference
+    result = []
 
+    transform = transforms.Compose([
+        transforms.Grayscale(),
+        transforms.Resize((32, 32)),
+        transforms.ToTensor(),
+    ])
 
-"""# Pre-processing
+    dataset = ImageFolder(
+        os.path.join(root_dir, 'test_data'), transform=transform
+    )
+    dataloader = DataLoader(dataset, batch_size=2048, shuffle=False)
+    for (x, _) in tqdm(dataloader, ncols=0, desc='Inference'):
+        x = x.cuda()
 
-Here we use Adam as our optimizer.
-"""
+        logits = model(x)
 
-feature_extractor = FeatureExtractor().cuda()
-label_predictor = LabelPredictor().cuda()
-domain_classifier = DomainClassifier().cuda()
+        x = torch.argmax(logits, dim=1).cpu().detach().numpy()
+        result.append(x)
 
-class_criterion = nn.CrossEntropyLoss()
-domain_criterion = nn.BCEWithLogitsLoss()
+    result = np.concatenate(result)
 
-optimizer_F = optim.Adam(feature_extractor.parameters())
-optimizer_C = optim.Adam(label_predictor.parameters())
-optimizer_D = optim.Adam(domain_classifier.parameters())
+    # Generate your submission
+    df = pd.DataFrame({'id': np.arange(0,len(result)), 'label': result})
+    df.to_csv('DaNN_submission.csv', index=False)
 
-"""# Start Training
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument('--train', action='store_true')
+    parser.add_argument('--inference', action='store_true')
+    parser.add_argument('--load-ckpt', type=str)
+
+    return parser.parse_args()
 
 
-## DaNN Implementation
+def main():
+    args = parse_args()
 
-In the original paper, Gradient Reversal Layer is used.
-Feature Extractor, Label Predictor, and Domain Classifier are all trained at the same time. In this code, we train Domain Classifier first, and then train our Feature Extractor (same concept as Generator and Discriminator training process in GAN).
+    if args.train:
+        model = train()
+        inference(model)
 
-## Reminder
-* Lambda, which controls the domain adversarial loss, is adaptive in the original paper. You can refer to [the original work](https://arxiv.org/pdf/1505.07818.pdf) . Here lambda is set to 0.1.
-* We do not have the label to target data, you can only evaluate your model by uploading your result to kaggle.:)
-"""
+    if args.inference:
+        model = Model()
 
-def train_epoch(src_dl: DataLoader, tgt_dl: DataLoader, lamb):
-    '''
-    Args:
-        source_dataloader: source data dataloader
-        target_dataloader: target data dataloader
-        lamb: control the balance of domain adaptation and classification.
-    '''
+        state_dict = torch.load('model.pth')['model']
+        model.load_state_dict(state_dict)
 
-    # D loss: Domain Classifier loss
-    # F loss: Feature Extractor & Label Predictor loss
-    running_D_loss, running_F_loss = 0.0, 0.0
-    total_hit, total_num = 0.0, 0.0
+        inference(model)
 
-    pbar = tqdm(zip(src_dl, tgt_dl), ncols=0)
-    for i, ((src_x, src_y), (tgt_x, _)) in enumerate(pbar):
-        src_x = src_x.cuda()
-        src_y = src_y.cuda()
-        tgt_x = tgt_x.cuda()
-
-        # Mixed the source data and target data, or it'll mislead the running params
-        #   of batch_norm. (running mean/var of source and target data are different.)
-        mixed_data = torch.cat([src_x, tgt_x], dim=0)
-        domain_label = torch.zeros([src_x.shape[0] + tgt_x.shape[0], 1]).cuda()
-        # set domain label of source data to be 1.
-        domain_label[:src_x.shape[0]] = 1
-
-        # Step 1 : train domain classifier
-        feature = feature_extractor(mixed_data)
-        # We don't need to train feature extractor in step 1.
-        # Thus we detach the feature neuron to avoid back-propagation.
-        domain_logits = domain_classifier(feature.detach())
-        loss = domain_criterion(domain_logits, domain_label)
-        running_D_loss+= loss.item()
-        loss.backward()
-        optimizer_D.step()
-
-        # Step 2 : train feature extractor and label classifier
-        class_logits = label_predictor(feature[:src_x.shape[0]])
-        domain_logits = domain_classifier(feature)
-        # loss = cross entropy of classification - lamb * domain binary cross entropy.
-        #  The reason why using subtraction is similar to generator loss in discriminator of GAN
-        loss = class_criterion(class_logits, src_y) - lamb * domain_criterion(domain_logits, domain_label)
-        running_F_loss+= loss.item()
-        loss.backward()
-        optimizer_F.step()
-        optimizer_C.step()
-
-        optimizer_D.zero_grad()
-        optimizer_F.zero_grad()
-        optimizer_C.zero_grad()
-
-        total_hit += torch.sum(torch.argmax(class_logits, dim=1) == src_y).item()
-        total_num += src_x.shape[0]
-
-    return running_D_loss / (i+1), running_F_loss / (i+1), total_hit / total_num
-
-# train 200 epochs
-for epoch in range(200):
-    train_D_loss, train_F_loss, train_acc = train_epoch(source_dataloader, target_dataloader, lamb=0.1)
-
-    torch.save(feature_extractor.state_dict(), f'extractor_model.bin')
-    torch.save(label_predictor.state_dict(), f'predictor_model.bin')
-
-    print('epoch {:>3d}: train D loss: {:6.4f}, train F loss: {:6.4f}, acc {:6.4f}'.format(epoch, train_D_loss, train_F_loss, train_acc))
-
-"""# Inference
-
-We use pandas to generate our csv file.
-
-BTW, the performance of the model trained for 200 epoches might be unstable. You can train for more epoches for a more stable performance.
-"""
-
-result = []
-label_predictor.eval()
-feature_extractor.eval()
-for i, (test_data, _) in enumerate(test_dataloader):
-    test_data = test_data.cuda()
-
-    class_logits = label_predictor(feature_extractor(test_data))
-
-    x = torch.argmax(class_logits, dim=1).cpu().detach().numpy()
-    result.append(x)
-
-result = np.concatenate(result)
-
-# Generate your submission
-df = pd.DataFrame({'id': np.arange(0,len(result)), 'label': result})
-df.to_csv('DaNN_submission.csv',index=False)
+if __name__ == '__main__':
+    main()
