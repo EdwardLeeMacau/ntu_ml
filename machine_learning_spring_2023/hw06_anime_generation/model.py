@@ -1,16 +1,18 @@
-from torch import nn
-import numpy as np
 import math
-import torch
-from typing import Callable
-from tqdm import tqdm
 from functools import partial
+from typing import Callable
+
+import numpy as np
+import pysnooper
+import torch
+import torch.nn.functional as F
+from dataset import Dataset
 from einops import rearrange, reduce, repeat
 from einops.layers.torch import Rearrange
-import torch.nn.functional as F
-import pysnooper
-from dataset import Dataset
+from torch import nn
 from torch.utils.data import DataLoader
+from tqdm import tqdm
+
 
 # Reference: https://huggingface.co/blog/annotated-diffusion#defining-the-forward-diffusion-process
 def cosine_beta_schedule(timesteps, s=0.008):

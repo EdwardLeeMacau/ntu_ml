@@ -95,11 +95,17 @@ class KLDivWithLogitsLoss(nn.Module):
         # https://pytorch.org/docs/stable/generated/torch.nn.KLDivLoss.html
         self.kl_div = nn.KLDivLoss(reduction="batchmean")
 
-    def forward(self, x, y):
-        x = F.log_softmax(x, dim=1)
-        y = F.softmax(y, dim=1)
+    def forward(self, input: torch.Tensor, target: torch.Tensor):
+        """
+        Arguments
+        ---------
+        input, target : torch.Tensor
+            Logits in shape (N, C)
+        """
+        input  = F.log_softmax(input, dim=1)        # Q(x)
+        target = F.softmax(target, dim=1)           # P(x)
 
-        return self.kl_div(x, y)
+        return self.kl_div(input, target)           # D_KL(P(x) || Q(x))
 
 def normalize_perturbation(p: torch.Tensor) -> torch.Tensor:
     """ Normalize tensor p to have max perturbation 1. """
@@ -282,4 +288,71 @@ class Model(nn.Module):
 #
 # Implementation of EMA. From homework 6 diffusion model.
 class WeightEMA:
-    pass
+    def __init__(self, params, src_params, alpha: float = 0.998):
+        self.params = list(params)
+        self.src_params = list(src_params)
+        self.alpha = alpha
+
+        for dest, src in zip(self.params, self.src_params):
+            dest.data[:] = src.data[:]
+
+    def step(self):
+        gamma = 1.0 - self.alpha            # exponential moving average weight
+
+        for dest, src in zip(self.params, self.src_params):
+            dest.data.mul_(self.alpha)
+            dest.data.add_(src.data * gamma)
+
+    def zero_grad(self):
+        pass
+
+if __name__ == "__main__":
+    def test_conditional_entropy():
+        f = ConditionalEntropy()
+
+        logits = torch.zeros((1, 2))
+        loss = f(logits)
+
+        assert(abs(loss - 0.693147) <= 1e-4), loss
+
+        logits = torch.Tensor([[0, 1]])
+        loss = f(logits)
+
+        assert(abs(loss - 0.582203) <= 1e-4), loss
+
+    def test_kldiv_with_logits():
+        f = KLDivWithLogitsLoss()
+
+        zeros = torch.zeros((1, 2))
+
+        logits = torch.zeros((1, 2))
+        loss = f(logits, logits)
+
+        assert(abs(loss) <= 1e-4), loss
+
+        logits = torch.Tensor([[0.2, 0.5]])
+        loss = f(logits, zeros)
+
+        assert(abs(loss - 0.011208) <= 1e-4), loss
+
+    def test_virtual_adversarial_loss():
+        model = nn.Sequential(
+            nn.Linear(2, 2, bias=False),
+        )
+
+        with torch.no_grad():
+            model[0].weight = nn.Parameter(torch.Tensor([[1, 0], [0, 1]]) * 100.)
+
+        # Verify model with example near the decision boundary.
+        x = torch.tensor([[1, 1]], dtype=torch.float)
+        z = model(x)
+
+        # assert(z.item() == torch.Tensor([0.5])), z.item()
+
+        f = VirtualAdversarialLoss(model, radius=1)
+        loss = f(x, z)
+        print(f'{loss=}')
+
+    test_conditional_entropy()
+    test_kldiv_with_logits()
+    test_virtual_adversarial_loss()

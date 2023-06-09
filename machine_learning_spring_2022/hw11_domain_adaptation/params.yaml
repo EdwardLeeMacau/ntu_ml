@@ -1,18 +1,19 @@
 env:
   dataset: /tmp2/edwardlee/dataset/real_or_drawing
   checkpoint: /tmp2/edwardlee/checkpoints/real_or_drawing
-iterations:
-  pretrain: 20000
-  train: 1500
-optimizer:
-  name: Adam
-  kwargs:
-    lr: 1.0e-3
-    weight_decay: 1.0e-5
-scheduler:
-  name: StepLR
-  kwargs:
-    step_size: 10000
-    gamma: 0.95
-batch-size: 32
 seed: 0
+training:
+  dann:
+    epochs: 1500
+    checkpointing: 100
+    batch-size: 32
+    optimizer:
+      name: Adam
+      kwargs:
+        lr: 1.0e-3
+        weight_decay: 1.0e-5
+    scheduler:
+      name: StepLR
+      kwargs:
+        step_size: 10000
+        gamma: 0.95
