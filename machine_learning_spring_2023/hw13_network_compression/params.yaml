@@ -1,0 +1,24 @@
+env:
+  dataset: /tmp2/edwardlee/dataset/food-11-network-compression/Food-11
+  checkpoint: /tmp2/edwardlee/checkpoints/food-11
+epochs: 1024
+optimizer:
+  name: Adam
+  kwargs:
+    lr: 3.0e-4
+    weight_decay: 1.0e-5
+scheduler:
+  name: StepLR
+  kwargs:
+    gamma: 0.1
+    step_size: 512
+    step_unit: epoch
+batch-size: 256
+knowledge-distillation:
+  alpha: 0.5
+  temperature: 2.0
+test-time-augmentation:
+  weight: 0.2
+  candidates: 11
+seed: 3407
+early-stop: 1024
