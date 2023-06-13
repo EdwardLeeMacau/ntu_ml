@@ -1,0 +1,2 @@
+checkpoint: './checkpoint.pth'
+dataset_dir: './food/'
